@@ -1,0 +1,14 @@
+[Unit]
+Description=datawall - Network data usage tracker
+Documentation=https://github.com/anomalyco/opencode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/datawall run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

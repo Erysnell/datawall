@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# Stop any running datawall daemon processes
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f "datawall start" 2>/dev/null || true
+fi
+
+exit 0

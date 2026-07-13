@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+echo " ┌──────────────────────────────────────────────────────────┐"
+echo " │                      datawall                           │"
+echo " │  Network data usage tracker per program                 │"
+echo " ├──────────────────────────────────────────────────────────┤"
+echo " │                                                         │"
+echo " │  To enable the daemon on boot:                          │"
+echo " │    systemctl --user enable --now datawall.service       │"
+echo " │                                                         │"
+echo " │  Usage:                                                 │"
+echo " │    datawall              show daily report               │"
+echo " │    datawall start        start daemon                   │"
+echo " │    datawall stop         stop daemon                    │"
+echo " └──────────────────────────────────────────────────────────┘"

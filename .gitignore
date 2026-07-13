@@ -1,0 +1,4 @@
+*.deb
+pkg/datawall/
+__pycache__/
+*.pyc

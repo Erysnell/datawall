@@ -1,0 +1,17 @@
+Package: datawall
+Version: 1.0.0
+Architecture: all
+Maintainer: Erysnell Gonzalez
+Depends: python3, python3-psutil, python3-rich
+Description: Track daily network usage per program
+ datawall runs a lightweight background daemon that samples
+ network traffic and attributes it to active processes.
+ It provides a Rich terminal UI showing per-program breakdown,
+ total daily usage, and current transfer speeds with bars.
+ .
+ Features:
+  * Per-program daily network usage (sent/received/total)
+  * Real-time transfer speed display
+  * Visual usage bars via Rich
+  * Automatic active interface detection
+  * Systemd user service integration

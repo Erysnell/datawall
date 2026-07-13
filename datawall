@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""datawall — Network data usage tracker per program"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+try:
+    import psutil
+except ImportError:
+    psutil = None  # type: ignore
+
+try:
+    from rich import box as _rich_box
+    from rich.console import Console as _RichConsole
+    from rich.table import Table as _RichTable
+    from rich.text import Text as _RichText
+    from rich.panel import Panel as _RichPanel
+    _rich_ok = True
+except ImportError:
+    _rich_ok = False
+
+DATA_DIR = Path.home() / '.datawall'
+STORE_PATH = DATA_DIR / 'store.json'
+PID_PATH = DATA_DIR / 'daemon.pid'
+LOG_PATH = DATA_DIR / 'daemon.log'
+SAMPLE_INTERVAL = 5
+
+
+def format_bytes(n: float) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(n) < 1024.0:
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+
+
+def format_speed(n: float) -> str:
+    return format_bytes(n) + '/s'
+
+
+def log(msg: str):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, 'a') as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
+# ── Network helpers ──────────────────────────────────────────
+
+def get_active_interface() -> Optional[str]:
+    try:
+        counters = psutil.net_io_counters(pernic=True)
+    except Exception as e:
+        log(f"get_active_interface counters error: {e}")
+        counters = {}
+    try:
+        stats = psutil.net_if_stats()
+    except Exception as e:
+        log(f"get_active_interface stats error: {e}")
+        stats = {}
+    for name in counters:
+        if name != 'lo' and (counters[name].bytes_sent > 0 or counters[name].bytes_recv > 0):
+            return name
+    for name in stats:
+        if name != 'lo' and stats[name].isup:
+            return name
+    log(f"Interfaces available: {list(counters.keys())}")
+    log(f"Interfaces up: {[k for k,v in stats.items() if v.isup]}")
+    return None
+
+
+def get_interface_counters(iface: str) -> tuple:
+    try:
+        counters = psutil.net_io_counters(pernic=True)
+        if iface in counters:
+            c = counters[iface]
+            return c.bytes_sent, c.bytes_recv
+    except Exception:
+        pass
+    return 0, 0
+
+
+def get_current_speed(iface: str) -> tuple:
+    s1, r1 = get_interface_counters(iface)
+    time.sleep(1)
+    s2, r2 = get_interface_counters(iface)
+    return max(0.0, float(s2 - s1)), max(0.0, float(r2 - r1))
+
+
+def get_process_connections() -> dict:
+    conns_by_pid = {}
+    try:
+        for conn in psutil.net_connections():
+            pid = conn.pid
+            if pid and pid > 0 and conn.status != 'LISTEN':
+                conns_by_pid[pid] = conns_by_pid.get(pid, 0) + 1
+    except Exception:
+        return {}
+    result = {}
+    for pid, count in conns_by_pid.items():
+        try:
+            proc = psutil.Process(pid)
+            result[str(pid)] = {'name': proc.name(), 'connections': count}
+        except Exception:
+            pass
+    return result
+
+
+def parse_ss_output(output: str) -> list:
+    sockets = []
+    current = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            m = re.search(r'"([^"]+)",pid=(\d+),fd=(\d+)', line)
+            if m:
+                current = {'name': m.group(1), 'pid': int(m.group(2)), 'fd': int(m.group(3))}
+            else:
+                current = {}
+        else:
+            if current:
+                acked = recv = None
+                ma = re.search(r'bytes_acked:(\d+)', line)
+                mr = re.search(r'bytes_received:(\d+)', line)
+                if ma:
+                    acked = int(ma.group(1))
+                if mr:
+                    recv = int(mr.group(1))
+                if acked is not None and recv is not None:
+                    sockets.append((current['pid'], current['fd'], current['name'], acked, recv))
+    return sockets
+
+
+def sample_sockdiag() -> list:
+    try:
+        r = subprocess.run(['ss', '-tpin'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return parse_ss_output(r.stdout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return []
+
+
+def ss_available() -> bool:
+    try:
+        subprocess.run(['ss', '-V'], capture_output=True, timeout=3)
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+# ── Data store ──────────────────────────────────────────────
+
+class DataStore:
+    def __init__(self):
+        self.path = STORE_PATH
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if self.path.exists():
+            try:
+                return json.loads(self.path.read_text())
+            except (json.JSONDecodeError, OSError) as e:
+                log(f"Corrupted store: {e}")
+        return {'days': {}}
+
+    def save(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix('.tmp')
+        try:
+            tmp.write_text(json.dumps(self.data, indent=2))
+            tmp.replace(self.path)
+        except OSError as e:
+            log(f"Save error: {e}")
+
+    def get_today(self) -> dict:
+        today = date.today().isoformat()
+        if today not in self.data['days']:
+            self.data['days'][today] = {
+                'total_sent': 0, 'total_recv': 0,
+                'processes': {},
+                'speed_sent': 0.0, 'speed_recv': 0.0,
+            }
+        return self.data['days'][today]
+
+    def reset_today(self):
+        self.data['days'].pop(date.today().isoformat(), None)
+        self.save()
+
+
+# ── Daemon ──────────────────────────────────────────────────
+
+def _write_pid():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PID_PATH.write_text(str(os.getpid()))
+
+
+def _remove_pid():
+    try:
+        PID_PATH.unlink()
+    except OSError:
+        pass
+
+
+def daemon_status() -> bool:
+    if not PID_PATH.exists():
+        return False
+    try:
+        pid = int(PID_PATH.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        _remove_pid()
+        return False
+
+
+def daemon_start():
+    if daemon_status():
+        print("datawall: daemon is already running")
+        return
+    print("datawall: starting daemon...")
+    sys.stdout.flush()
+    pid = os.fork()
+    if pid > 0:
+        return
+    os.setsid()
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_PATH, 'a') as lf, open(os.devnull, 'r') as null:
+        os.dup2(null.fileno(), 0)
+        os.dup2(lf.fileno(), 1)
+        os.dup2(lf.fileno(), 2)
+    _write_pid()
+    signal.signal(signal.SIGTERM, lambda *_: _daemon_exit(0))
+    log("Daemon started")
+    daemon_loop()
+
+
+def daemon_run():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    daemon_loop()
+
+
+def _daemon_exit(code: int = 0):
+    log(f"Daemon stopping (code {code})")
+    _remove_pid()
+    sys.exit(code)
+
+
+def daemon_stop():
+    if not PID_PATH.exists():
+        print("datawall: daemon is not running")
+        return
+    try:
+        pid = int(PID_PATH.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(10):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.5)
+            except OSError:
+                break
+        _remove_pid()
+        print("datawall: daemon stopped")
+    except (OSError, ValueError) as e:
+        print(f"datawall: failed to stop daemon: {e}")
+        _remove_pid()
+
+
+def daemon_loop():
+    iface = get_active_interface()
+    if not iface:
+        log("No active network interface found")
+        _daemon_exit(1)
+    log(f"Monitoring interface: {iface}")
+
+    store = DataStore()
+    use_ss = ss_available()
+    socket_cache = {}
+    if use_ss:
+        log("Using SOCK_DIAG (ss) for exact per-process tracking")
+
+    while True:
+        time.sleep(SAMPLE_INTERVAL)
+        try:
+            today = store.get_today()
+            cur_tx, cur_rx = get_interface_counters(iface)
+            now = time.time()
+
+            if 'last_tx' not in today:
+                today['last_tx'] = cur_tx
+                today['last_rx'] = cur_rx
+                today['last_time'] = now
+                today['speed_sent'] = 0.0
+                today['speed_recv'] = 0.0
+                store.save()
+                continue
+
+            elapsed = now - today['last_time']
+            if elapsed > SAMPLE_INTERVAL * 3:
+                today['last_tx'] = cur_tx
+                today['last_rx'] = cur_rx
+                today['last_time'] = now
+                today['speed_sent'] = 0.0
+                today['speed_recv'] = 0.0
+                socket_cache.clear()
+                log(f"Large gap detected ({elapsed:.0f}s), resetting baseline")
+                store.save()
+                continue
+
+            delta_tx = max(0, cur_tx - today['last_tx'])
+            delta_rx = max(0, cur_rx - today['last_rx'])
+            interval = max(elapsed, 0.1)
+            today['speed_sent'] = round(delta_tx / interval, 1)
+            today['speed_recv'] = round(delta_rx / interval, 1)
+
+            if delta_tx > 0 or delta_rx > 0:
+                today['total_sent'] += delta_tx
+                today['total_recv'] += delta_rx
+
+                if use_ss:
+                    current_ss = sample_sockdiag()
+                    seen = set()
+                    proc_deltas = {}
+                    tracked_tx = 0
+                    tracked_rx = 0
+
+                    for pid, fd, name, acked, recv in current_ss:
+                        key = (pid, fd)
+                        seen.add(key)
+                        if key in socket_cache:
+                            old_a, old_r = socket_cache[key]
+                            if acked >= old_a and recv >= old_r:
+                                ds = acked - old_a
+                                dr = recv - old_r
+                                if ds > 0 or dr > 0:
+                                    if pid not in proc_deltas:
+                                        proc_deltas[pid] = {'name': name, 'tx': 0, 'rx': 0}
+                                    proc_deltas[pid]['tx'] += ds
+                                    proc_deltas[pid]['rx'] += dr
+                                    tracked_tx += ds
+                                    tracked_rx += dr
+                        socket_cache[key] = (acked, recv)
+
+                    for k in list(socket_cache):
+                        if k not in seen:
+                            del socket_cache[k]
+
+                    for data in proc_deltas.values():
+                        nm = data['name']
+                        if nm not in today['processes']:
+                            today['processes'][nm] = {'sent': 0, 'recv': 0}
+                        today['processes'][nm]['sent'] += data['tx']
+                        today['processes'][nm]['recv'] += data['rx']
+
+                    remaining_tx = max(0, delta_tx - tracked_tx)
+                    remaining_rx = max(0, delta_rx - tracked_rx)
+                    if remaining_tx > 0 or remaining_rx > 0:
+                        if 'other' not in today['processes']:
+                            today['processes']['other'] = {'sent': 0, 'recv': 0}
+                        today['processes']['other']['sent'] += remaining_tx
+                        today['processes']['other']['recv'] += remaining_rx
+                else:
+                    active = get_process_connections()
+                    total_conns = sum(p['connections'] for p in active.values())
+                    if total_conns > 0:
+                        for info in active.values():
+                            w = info['connections'] / total_conns
+                            nm = info['name']
+                            if nm not in today['processes']:
+                                today['processes'][nm] = {'sent': 0, 'recv': 0}
+                            today['processes'][nm]['sent'] += int(delta_tx * w)
+                            today['processes'][nm]['recv'] += int(delta_rx * w)
+                    else:
+                        if 'other' not in today['processes']:
+                            today['processes']['other'] = {'sent': 0, 'recv': 0}
+                        today['processes']['other']['sent'] += delta_tx
+                        today['processes']['other']['recv'] += delta_rx
+
+            today['last_tx'] = cur_tx
+            today['last_rx'] = cur_rx
+            today['last_time'] = now
+            store.save()
+        except Exception as e:
+            log(f"Loop error: {e}")
+            time.sleep(5)
+
+
+# ── Reporter ────────────────────────────────────────────────
+
+def show_report():
+    if not _rich_ok:
+        print("ERROR: 'rich' is required. Install with: pip install rich")
+        sys.exit(1)
+
+    store = DataStore()
+    today = store.get_today()
+    console = _RichConsole()
+    title = _RichText(f"DataWall — {date.today().isoformat()}", style="bold cyan")
+    iface = get_active_interface()
+    if iface:
+        up, down = get_current_speed(iface)
+        sub = f"Speed:  ↑ {format_speed(up)}  ↓ {format_speed(down)}   [{iface}]"
+    else:
+        sub = "Speed:  [dim]not available[/dim]"
+
+    total_sent = today.get('total_sent', 0)
+    total_recv = today.get('total_recv', 0)
+    total_all = total_sent + total_recv
+
+    table = _RichTable(box=_rich_box.HEAVY, header_style="bold magenta")
+    table.add_column("Program")
+    table.add_column("Sent", justify="right", style="yellow")
+    table.add_column("Received", justify="right", style="green")
+    table.add_column("Total", justify="right", style="cyan")
+    table.add_column("%", justify="left")
+
+    procs = today.get('processes', {})
+    sorted_procs = sorted(
+        procs.items(),
+        key=lambda x: x[1]['sent'] + x[1]['recv'],
+        reverse=True
+    )
+    for pname, pdata in sorted_procs:
+        ps = pdata['sent']
+        pr = pdata['recv']
+        pt = ps + pr
+        pct = (pt / total_all * 100) if total_all > 0 else 0
+        n = max(1, int(pct / 100 * 10))
+        bar = '█' * n + '░' * (10 - n)
+        table.add_row(
+            pname,
+            format_bytes(ps),
+            format_bytes(pr),
+            format_bytes(pt),
+            f"{bar} {pct:5.1f}%"
+        )
+
+    table.add_row(
+        "[bold]TOTAL[/bold]",
+        f"[bold]{format_bytes(total_sent)}[/bold]",
+        f"[bold]{format_bytes(total_recv)}[/bold]",
+        f"[bold]{format_bytes(total_all)}[/bold]",
+        ""
+    )
+
+    panel = _RichPanel(table, title=title, subtitle=sub, border_style="cyan", padding=(1, 2))
+    console.print()
+    console.print(panel)
+
+    running = daemon_status()
+    sc = "green" if running else "red"
+    console.print(f"  Daemon: [{sc}]{'running' if running else 'stopped'}[/{sc}]    ")
+    console.print()
+
+
+# ── CLI ─────────────────────────────────────────────────────
+
+def main():
+    if psutil is None:
+        print("ERROR: 'psutil' is required. Install with: pip install psutil")
+        sys.exit(1)
+
+    p = argparse.ArgumentParser(
+        description="datawall — Network data usage tracker per program",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+commands:
+  datawall              show daily usage report (default)
+  datawall start        start background daemon (fork)
+  datawall run          run daemon in foreground (for systemd)
+  datawall stop         stop background daemon
+  datawall restart      restart the daemon
+  datawall status       check if daemon is running
+  datawall reset        reset today's accumulated data
+        """
+    )
+    p.add_argument(
+        'command', nargs='?', default='report',
+        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset']
+    )
+
+    args = p.parse_args()
+
+    if args.command == 'start':
+        daemon_start()
+    elif args.command in ('run', 'daemon'):
+        daemon_run()
+    elif args.command == 'stop':
+        daemon_stop()
+    elif args.command == 'restart':
+        daemon_stop()
+        time.sleep(1)
+        daemon_start()
+    elif args.command == 'status':
+        print("datawall: daemon is", "running" if daemon_status() else "stopped")
+    elif args.command == 'reset':
+        DataStore().reset_today()
+        print("datawall: today's data has been reset")
+    else:
+        show_report()
+
+
+if __name__ == '__main__':
+    main()

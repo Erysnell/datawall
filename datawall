@@ -21,6 +21,7 @@ except ImportError:
 try:
     from rich import box as _rich_box
     from rich.console import Console as _RichConsole
+    from rich.live import Live as _RichLive
     from rich.table import Table as _RichTable
     from rich.text import Text as _RichText
     from rich.panel import Panel as _RichPanel
@@ -490,6 +491,146 @@ def show_report():
     console.print()
 
 
+# ── Watch mode ──────────────────────────────────────────────
+
+def watch_mode():
+    if not _rich_ok:
+        print("ERROR: 'rich' is required. Install with: pip install rich")
+        sys.exit(1)
+
+    iface = get_active_interface()
+    daemon_alive = daemon_status()
+    store = DataStore()
+    console = _RichConsole()
+
+    speed_cache = {}
+    old_tx = old_rx = None
+    interval = 2.0
+
+    try:
+        with _RichLive("", screen=True, refresh_per_second=2, console=console) as live:
+            while True:
+                time.sleep(interval)
+
+                cur_ss = sample_sockdiag()
+                if iface:
+                    cur_tx, cur_rx = get_interface_counters(iface)
+                else:
+                    cur_tx = cur_rx = 0
+
+                # per-process speeds from socket cache
+                proc_speed = {}
+                seen = set()
+                ss_tx = ss_rx = 0
+
+                for pid, fd, name, acked, recv in cur_ss:
+                    key = (pid, fd)
+                    seen.add(key)
+                    if key in speed_cache:
+                        old_a, old_r = speed_cache[key]
+                        if acked >= old_a and recv >= old_r:
+                            ds = acked - old_a
+                            dr = recv - old_r
+                            if ds > 0 or dr > 0:
+                                if name not in proc_speed:
+                                    proc_speed[name] = {'tx': 0.0, 'rx': 0.0}
+                                proc_speed[name]['tx'] += ds
+                                proc_speed[name]['rx'] += dr
+                                ss_tx += ds
+                                ss_rx += dr
+                    speed_cache[key] = (acked, recv)
+
+                for k in list(speed_cache):
+                    if k not in seen:
+                        del speed_cache[k]
+
+                # convert to bytes/sec
+                for name in proc_speed:
+                    proc_speed[name]['tx'] /= interval
+                    proc_speed[name]['rx'] /= interval
+
+                # interface deltas in this interval
+                iface_tx = cur_tx - old_tx if old_tx is not None else 0
+                iface_rx = cur_rx - old_rx if old_rx is not None else 0
+                old_tx, old_rx = cur_tx, cur_rx
+
+                # timing correction
+                if ss_tx > iface_tx and ss_tx > 0:
+                    scale = iface_tx / ss_tx
+                    for name in proc_speed:
+                        proc_speed[name]['tx'] *= scale
+                    ss_tx = iface_tx
+                if ss_rx > iface_rx and ss_rx > 0:
+                    scale = iface_rx / ss_rx
+                    for name in proc_speed:
+                        proc_speed[name]['rx'] *= scale
+                    ss_rx = iface_rx
+
+                # residual "other" speed
+                other_tx = max(0.0, iface_tx / interval - ss_tx / interval) if old_tx is not None else 0.0
+                other_rx = max(0.0, iface_rx / interval - ss_rx / interval) if old_rx is not None else 0.0
+                if other_tx > 0 or other_rx > 0:
+                    proc_speed['other'] = {'tx': other_tx, 'rx': other_rx}
+
+                # daily totals from store
+                today = store.get_today()
+                total_sent = today.get('total_sent', 0)
+                total_recv = today.get('total_recv', 0)
+                total_all = total_sent + total_recv
+                proc_store = today.get('processes', {})
+
+                # build table
+                table = _RichTable(box=_rich_box.HEAVY, header_style="bold magenta")
+                table.add_column("Program", no_wrap=True)
+                table.add_column("Down ▼", justify="right", style="green")
+                table.add_column("Up ▲", justify="right", style="yellow")
+                table.add_column("Total today", justify="right", style="cyan")
+                table.add_column("%", justify="left")
+
+                merged = set(list(proc_speed.keys()) + list(proc_store.keys()))
+                rows = []
+                for name in merged:
+                    tx = proc_speed.get(name, {}).get('tx', 0.0)
+                    rx = proc_speed.get(name, {}).get('rx', 0.0)
+                    pdata = proc_store.get(name, {})
+                    ps = pdata.get('sent', 0)
+                    pr = pdata.get('recv', 0)
+                    pt = ps + pr
+                    pct = (pt / total_all * 100) if total_all > 0 else 0
+                    rows.append((name, tx, rx, pt, pct))
+
+                rows.sort(key=lambda r: r[4] if r[3] > 0 else r[1] + r[2], reverse=True)
+
+                for name, tx, rx, pt, pct in rows:
+                    n = max(1, int(pct / 100 * 10))
+                    bar = '█' * n + '░' * (10 - n)
+                    table.add_row(
+                        name,
+                        format_speed(rx) if rx > 0 else "[dim]—[/dim]",
+                        format_speed(tx) if tx > 0 else "[dim]—[/dim]",
+                        format_bytes(pt),
+                        f"{bar} {pct:5.1f}%" if pt > 0 else ""
+                    )
+
+                total_tx_speed = (iface_tx / interval) if old_tx is not None else 0.0
+                total_rx_speed = (iface_rx / interval) if old_rx is not None else 0.0
+                table.add_row(
+                    "[bold]TOTAL[/bold]",
+                    f"[bold]{format_speed(total_rx_speed)}[/bold]",
+                    f"[bold]{format_speed(total_tx_speed)}[/bold]",
+                    f"[bold]{format_bytes(total_all)}[/bold]",
+                    ""
+                )
+
+                title = _RichText(f"DataWall Watch — {date.today().isoformat()}", style="bold cyan")
+                sub = f"  Daemon: {'running' if daemon_alive else 'stopped'}  Interface: {iface or 'N/A'}  Ctrl+C to quit"
+                panel = _RichPanel(table, title=title, subtitle=sub, border_style="cyan", padding=(1, 1))
+                live.update(panel)
+
+    except KeyboardInterrupt:
+        pass
+
+
 # ── CLI ─────────────────────────────────────────────────────
 
 def main():
@@ -509,11 +650,12 @@ commands:
   datawall restart      restart the daemon
   datawall status       check if daemon is running
   datawall reset        reset today's accumulated data
+  datawall watch        real-time bandwidth monitor (htop-like)
         """
     )
     p.add_argument(
         'command', nargs='?', default='report',
-        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset']
+        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch']
     )
 
     args = p.parse_args()
@@ -533,6 +675,8 @@ commands:
     elif args.command == 'reset':
         DataStore().reset_today()
         print("datawall: today's data has been reset")
+    elif args.command == 'watch':
+        watch_mode()
     else:
         show_report()
 

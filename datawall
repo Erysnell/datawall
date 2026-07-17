@@ -124,6 +124,15 @@ def parse_ss_output(output: str) -> list:
         if not line.strip():
             continue
         if not line[0].isspace():
+            parts = line.split()
+            if len(parts) >= 5:
+                local = parts[3]
+                remote = parts[4]
+                local_is_lo = local.startswith('127.') or local.startswith('[::1]')
+                remote_is_lo = remote.startswith('127.') or remote.startswith('[::1]')
+                if local_is_lo and remote_is_lo:
+                    current = {}
+                    continue
             m = re.search(r'"([^"]+)",pid=(\d+),fd=(\d+)', line)
             if m:
                 current = {'name': m.group(1), 'pid': int(m.group(2)), 'fd': int(m.group(3))}
@@ -360,6 +369,18 @@ def daemon_loop():
                     for k in list(socket_cache):
                         if k not in seen:
                             del socket_cache[k]
+
+                    if tracked_tx > delta_tx and tracked_tx > 0:
+                        scale = delta_tx / tracked_tx
+                        for data in proc_deltas.values():
+                            data['tx'] = int(data['tx'] * scale)
+                        tracked_tx = delta_tx
+
+                    if tracked_rx > delta_rx and tracked_rx > 0:
+                        scale = delta_rx / tracked_rx
+                        for data in proc_deltas.values():
+                            data['rx'] = int(data['rx'] * scale)
+                        tracked_rx = delta_rx
 
                     for data in proc_deltas.values():
                         nm = data['name']

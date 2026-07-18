@@ -500,7 +500,6 @@ def watch_mode():
 
     iface = get_active_interface()
     daemon_alive = daemon_status()
-    store = DataStore()
     console = _RichConsole()
 
     speed_cache = {}
@@ -572,8 +571,8 @@ def watch_mode():
                 if other_tx > 0 or other_rx > 0:
                     proc_speed['other'] = {'tx': other_tx, 'rx': other_rx}
 
-                # daily totals from store
-                today = store.get_today()
+                # daily totals from store (reload each iteration to pick up daemon updates)
+                today = DataStore().get_today()
                 total_sent = today.get('total_sent', 0)
                 total_recv = today.get('total_recv', 0)
                 total_all = total_sent + total_recv

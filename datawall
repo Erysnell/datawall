@@ -33,6 +33,7 @@ DATA_DIR = Path.home() / '.datawall'
 STORE_PATH = DATA_DIR / 'store.json'
 PID_PATH = DATA_DIR / 'daemon.pid'
 LOG_PATH = DATA_DIR / 'daemon.log'
+CONFIG_PATH = DATA_DIR / 'config.json'
 SAMPLE_INTERVAL = 5
 
 
@@ -46,6 +47,20 @@ def format_bytes(n: float) -> str:
 
 def format_speed(n: float) -> str:
     return format_bytes(n) + '/s'
+
+
+def parse_bytes(s: str) -> int:
+    s = s.strip().lower()
+    if s in ('off', 'none', '0'):
+        return 0
+    units = {'b': 1, 'kb': 1024, 'mb': 1024**2, 'gb': 1024**3, 'tb': 1024**4}
+    m = re.match(r'^([\d.]+)\s*(' + '|'.join(units) + r')$', s)
+    if m:
+        return int(float(m.group(1)) * units[m.group(2)])
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError(f"invalid size: '{s}' (e.g. 5GB, 500MB, off)")
 
 
 def log(msg: str):
@@ -207,6 +222,43 @@ class DataStore:
 
     def reset_today(self):
         self.data['days'].pop(date.today().isoformat(), None)
+        self.save()
+
+
+# ── Config ──────────────────────────────────────────────────
+
+class Config:
+    def __init__(self):
+        self.path = CONFIG_PATH
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if self.path.exists():
+            try:
+                return json.loads(self.path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
+
+    def save(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix('.tmp')
+        try:
+            tmp.write_text(json.dumps(self.data, indent=2))
+            tmp.replace(self.path)
+        except OSError:
+            pass
+
+    def get_daily_limit(self) -> Optional[int]:
+        v = self.data.get('daily_limit')
+        return v if isinstance(v, int) and v > 0 else None
+
+    def set_daily_limit(self, bytes_val: int):
+        self.data['daily_limit'] = bytes_val
+        self.save()
+
+    def remove_daily_limit(self):
+        self.data.pop('daily_limit', None)
         self.save()
 
 
@@ -475,6 +527,7 @@ def show_report(days: Optional[int] = None):
             sub = f"Speed:  ↑ {format_speed(up)}  ↓ {format_speed(down)}   [{iface}]"
         else:
             sub = "Speed:  [dim]not available[/dim]"
+        sub = _limit_warning(total_all) + sub
         show_avg = False
 
     table = _RichTable(box=_rich_box.HEAVY, header_style="bold magenta")
@@ -657,12 +710,53 @@ def watch_mode():
                 )
 
                 title = _RichText(f"DataWall Watch — {date.today().isoformat()}", style="bold cyan")
-                sub = f"  Daemon: {'running' if daemon_alive else 'stopped'}  Interface: {iface or 'N/A'}  Ctrl+C to quit"
+                sub = _limit_warning(total_all) + f"  Daemon: {'running' if daemon_alive else 'stopped'}  Interface: {iface or 'N/A'}  Ctrl+C to quit"
                 panel = _RichPanel(table, title=title, subtitle=sub, border_style="cyan", padding=(1, 1))
                 live.update(panel)
 
     except KeyboardInterrupt:
         pass
+
+
+# ── Limit / alert helpers ───────────────────────────────────
+
+def _limit_warning(total_bytes: int) -> str:
+    cfg = Config()
+    limit = cfg.get_daily_limit()
+    if limit is None or total_bytes <= 0:
+        return ''
+    pct = total_bytes / limit * 100
+    if pct >= 100:
+        return f"[bold red]⚠ EXCEEDED: {format_bytes(total_bytes)} / {format_bytes(limit)} ({pct:.0f}%)[/bold red]  |  "
+    if pct >= 80:
+        return f"[bold yellow]⚠ Near limit: {format_bytes(total_bytes)} / {format_bytes(limit)} ({pct:.0f}%)[/bold yellow]  |  "
+    return ''
+
+
+def limit_mode(arg: Optional[str] = None):
+    cfg = Config()
+    if arg is None:
+        limit = cfg.get_daily_limit()
+        store = DataStore()
+        today = store.get_today()
+        total = today.get('total_sent', 0) + today.get('total_recv', 0)
+        if limit:
+            pct = total / limit * 100
+            print(f"datawall: daily limit: {format_bytes(limit)}  ({format_bytes(total)} used — {pct:.1f}%)")
+        else:
+            print("datawall: no daily limit set")
+        return
+    try:
+        b = parse_bytes(arg)
+    except ValueError as e:
+        print(f"datawall: {e}")
+        sys.exit(1)
+    if b <= 0:
+        cfg.remove_daily_limit()
+        print("datawall: daily limit removed")
+    else:
+        cfg.set_daily_limit(b)
+        print(f"datawall: daily limit set to {format_bytes(b)}")
 
 
 # ── CLI ─────────────────────────────────────────────────────
@@ -686,13 +780,16 @@ commands:
   datawall reset        reset today's accumulated data
   datawall watch        real-time bandwidth monitor (htop-like)
   datawall days N       aggregated report for last N days
+  datawall limit        show current daily limit and usage
+  datawall limit SIZE   set daily limit (e.g. 5GB, 500MB)
+  datawall limit off    remove daily limit
         """
     )
     p.add_argument(
         'command', nargs='?', default='report',
-        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch', 'days']
+        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch', 'days', 'limit']
     )
-    p.add_argument('days_num', nargs='?', type=int, default=None,
+    p.add_argument('arg1', nargs='?', type=str, default=None,
                    help=argparse.SUPPRESS)
 
     args = p.parse_args()
@@ -715,10 +812,16 @@ commands:
     elif args.command == 'watch':
         watch_mode()
     elif args.command == 'days':
-        if args.days_num is None or args.days_num < 1:
+        try:
+            n = int(args.arg1) if args.arg1 else None
+        except ValueError:
+            n = None
+        if n is None or n < 1:
             print("datawall: usage: datawall days N")
             sys.exit(1)
-        show_report(days=args.days_num)
+        show_report(days=n)
+    elif args.command == 'limit':
+        limit_mode(args.arg1)
     else:
         show_report()
 

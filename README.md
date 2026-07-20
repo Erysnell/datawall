@@ -66,6 +66,9 @@ ln -sf "$PWD/datawall" ~/.local/bin/datawall
 | `datawall reset` | Reset today's accumulated data |
 | `datawall watch` | Real-time bandwidth monitor (top/htop-like) |
 | `datawall days N` | Aggregated report for last N days |
+| `datawall limit` | Show daily limit and current usage |
+| `datawall limit SIZE` | Set daily limit (e.g. 5GB, 500MB) |
+| `datawall limit off` | Remove daily limit |
 
 ## Auto-start with systemd
 
@@ -124,6 +127,19 @@ day column.
 - **Interface speed** — total up/down from `psutil.net_io_counters()`
 
 Press `Ctrl+C` to exit.
+
+### 6. Daily limit
+
+`datawall limit 5GB` sets a daily traffic limit stored in
+`~/.datawall/config.json`. The report and watch mode automatically
+show a warning in the subtitle when the usage approaches or exceeds
+the limit:
+
+- **≥80%**: yellow warning `⚠ Near limit: 4.5 GB / 5.0 GB (90%)`
+- **≥100%**: red warning `⚠ EXCEEDED: 6.2 GB / 5.0 GB (124%)`
+
+The daemon does not enforce the limit — it is a purely visual alert
+in the UI. Use `datawall limit off` to remove it.
 
 ## Accuracy
 

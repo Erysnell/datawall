@@ -64,6 +64,8 @@ ln -sf "$PWD/datawall" ~/.local/bin/datawall
 | `datawall restart` | Restart daemon |
 | `datawall status` | Check if daemon is running |
 | `datawall reset` | Reset today's accumulated data |
+| `datawall watch` | Real-time bandwidth monitor (top/htop-like) |
+| `datawall days N` | Aggregated report for last N days |
 
 ## Auto-start with systemd
 
@@ -103,6 +105,26 @@ displays a Rich table with:
 - Current speed (live 1-second measurement)
 - Daemon status
 
+### 4. Historical reports
+
+`datawall days 7` (or 30, 90, etc.) aggregates data across multiple days
+from `store.json`, summing totals per program and showing an average per
+day column.
+
+### 5. Watch mode
+
+`datawall watch` opens a real-time terminal UI (alternate screen, like
+`top`/`htop`) that updates every 2 seconds, showing:
+
+- **Per-process upload/download speeds** — sampled from `ss -tpin` with
+  socket cache deltas and timing correction
+- **Daily accumulated totals** — read live from `store.json` (reloaded
+  each cycle, so daemon updates appear automatically)
+- **Residual "other" traffic** — interface traffic not captured by `ss`
+- **Interface speed** — total up/down from `psutil.net_io_counters()`
+
+Press `Ctrl+C` to exit.
+
 ## Accuracy
 
 | Component | Source | Accuracy |
@@ -137,7 +159,8 @@ Data is stored in `~/.datawall/store.json`:
 network interface (WiFi or ethernet). Loopback (`lo`) is ignored.
 
 **Report shows 0 bytes:** The daemon needs at least 5 seconds to
-accumulate data after starting.
+accumulate data after starting. `datawall days N` will show 0 for
+future dates with no data.
 
 **"other" has a high %:** Normal during the first few samples. Over time
 the percentage stabilizes at a low value. A sustained high % indicates

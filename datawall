@@ -9,7 +9,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -425,34 +425,67 @@ def daemon_loop():
 
 # ── Reporter ────────────────────────────────────────────────
 
-def show_report():
+def show_report(days: Optional[int] = None):
     if not _rich_ok:
         print("ERROR: 'rich' is required. Install with: pip install rich")
         sys.exit(1)
 
     store = DataStore()
-    today = store.get_today()
     console = _RichConsole()
-    title = _RichText(f"DataWall — {date.today().isoformat()}", style="bold cyan")
-    iface = get_active_interface()
-    if iface:
-        up, down = get_current_speed(iface)
-        sub = f"Speed:  ↑ {format_speed(up)}  ↓ {format_speed(down)}   [{iface}]"
-    else:
-        sub = "Speed:  [dim]not available[/dim]"
 
-    total_sent = today.get('total_sent', 0)
-    total_recv = today.get('total_recv', 0)
-    total_all = total_sent + total_recv
+    if days and days > 0:
+        # ── aggregate over last N days ──
+        today = date.today()
+        date_strings = [(today - timedelta(days=i)).isoformat() for i in range(days)]
+
+        agg = {'total_sent': 0, 'total_recv': 0, 'processes': {}}
+        days_with_data = 0
+        for ds in date_strings:
+            if ds in store.data['days']:
+                d = store.data['days'][ds]
+                agg['total_sent'] += d.get('total_sent', 0)
+                agg['total_recv'] += d.get('total_recv', 0)
+                for pname, pdata in d.get('processes', {}).items():
+                    if pname not in agg['processes']:
+                        agg['processes'][pname] = {'sent': 0, 'recv': 0}
+                    agg['processes'][pname]['sent'] += pdata.get('sent', 0)
+                    agg['processes'][pname]['recv'] += pdata.get('recv', 0)
+                days_with_data += 1
+
+        total_sent = agg['total_sent']
+        total_recv = agg['total_recv']
+        total_all = total_sent + total_recv
+        procs = agg['processes']
+        start_date = date_strings[days - 1]
+        end_date = date_strings[0]
+        title = _RichText(f"DataWall — Last {days} days ({start_date} → {end_date})", style="bold cyan")
+        sub = f"Days with data: {days_with_data}/{days}"
+        show_avg = True
+    else:
+        # ── single-day report ──
+        today = store.get_today()
+        total_sent = today.get('total_sent', 0)
+        total_recv = today.get('total_recv', 0)
+        total_all = total_sent + total_recv
+        procs = today.get('processes', {})
+        title = _RichText(f"DataWall — {date.today().isoformat()}", style="bold cyan")
+        iface = get_active_interface()
+        if iface:
+            up, down = get_current_speed(iface)
+            sub = f"Speed:  ↑ {format_speed(up)}  ↓ {format_speed(down)}   [{iface}]"
+        else:
+            sub = "Speed:  [dim]not available[/dim]"
+        show_avg = False
 
     table = _RichTable(box=_rich_box.HEAVY, header_style="bold magenta")
     table.add_column("Program")
     table.add_column("Sent", justify="right", style="yellow")
     table.add_column("Received", justify="right", style="green")
     table.add_column("Total", justify="right", style="cyan")
+    if show_avg:
+        table.add_column("Avg/day", justify="right", style="blue")
     table.add_column("%", justify="left")
 
-    procs = today.get('processes', {})
     sorted_procs = sorted(
         procs.items(),
         key=lambda x: x[1]['sent'] + x[1]['recv'],
@@ -465,30 +498,32 @@ def show_report():
         pct = (pt / total_all * 100) if total_all > 0 else 0
         n = max(1, int(pct / 100 * 10))
         bar = '█' * n + '░' * (10 - n)
-        table.add_row(
-            pname,
-            format_bytes(ps),
-            format_bytes(pr),
-            format_bytes(pt),
-            f"{bar} {pct:5.1f}%"
-        )
+        row = [pname, format_bytes(ps), format_bytes(pr), format_bytes(pt)]
+        if show_avg:
+            row.append(format_bytes(pt / days_with_data))
+        row.append(f"{bar} {pct:5.1f}%")
+        table.add_row(*row)
 
-    table.add_row(
+    total_row = [
         "[bold]TOTAL[/bold]",
         f"[bold]{format_bytes(total_sent)}[/bold]",
         f"[bold]{format_bytes(total_recv)}[/bold]",
         f"[bold]{format_bytes(total_all)}[/bold]",
-        ""
-    )
+    ]
+    if show_avg:
+        total_row.append(f"[bold]{format_bytes(total_all / days_with_data)}[/bold]")
+    total_row.append("")
+    table.add_row(*total_row)
 
     panel = _RichPanel(table, title=title, subtitle=sub, border_style="cyan", padding=(1, 2))
     console.print()
     console.print(panel)
 
-    running = daemon_status()
-    sc = "green" if running else "red"
-    console.print(f"  Daemon: [{sc}]{'running' if running else 'stopped'}[/{sc}]    ")
-    console.print()
+    if not days:
+        running = daemon_status()
+        sc = "green" if running else "red"
+        console.print(f"  Daemon: [{sc}]{'running' if running else 'stopped'}[/{sc}]    ")
+        console.print()
 
 
 # ── Watch mode ──────────────────────────────────────────────
@@ -650,12 +685,15 @@ commands:
   datawall status       check if daemon is running
   datawall reset        reset today's accumulated data
   datawall watch        real-time bandwidth monitor (htop-like)
+  datawall days N       aggregated report for last N days
         """
     )
     p.add_argument(
         'command', nargs='?', default='report',
-        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch']
+        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch', 'days']
     )
+    p.add_argument('days_num', nargs='?', type=int, default=None,
+                   help=argparse.SUPPRESS)
 
     args = p.parse_args()
 
@@ -676,6 +714,11 @@ commands:
         print("datawall: today's data has been reset")
     elif args.command == 'watch':
         watch_mode()
+    elif args.command == 'days':
+        if args.days_num is None or args.days_num < 1:
+            print("datawall: usage: datawall days N")
+            sys.exit(1)
+        show_report(days=args.days_num)
     else:
         show_report()
 

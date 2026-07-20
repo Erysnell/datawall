@@ -62,6 +62,8 @@ ln -sf "$PWD/datawall" ~/.local/bin/datawall
 | `datawall restart` | Reinicia el daemon |
 | `datawall status` | Muestra si el daemon está corriendo |
 | `datawall reset` | Resetea los datos acumulados de hoy |
+| `datawall watch` | Monitor de ancho de banda en tiempo real (top/htop) |
+| `datawall days N` | Reporte agregado de los últimos N días |
 
 ## Auto-inicio con systemd
 
@@ -101,6 +103,26 @@ muestra una tabla con Rich con:
 - Velocidad actual (medición en vivo de 1 segundo)
 - Estado del daemon
 
+### 4. Reportes históricos
+
+`datawall days 7` (o 30, 90, etc.) agrega datos de múltiples días
+desde `store.json`, sumando los totales por programa y mostrando un
+promedio por día.
+
+### 5. Modo watch
+
+`datawall watch` abre una interfaz en tiempo real (pantalla alternativa,
+como `top`/`htop`) que se actualiza cada 2 segundos mostrando:
+
+- **Velocidad de subida/bajada por proceso** — muestreando `ss -tpin`
+  con caché de sockets y corrección de timing
+- **Totales acumulados del día** — leídos en vivo desde `store.json`
+  (recargado en cada ciclo, los cambios del daemon aparecen solos)
+- **Tráfico residual "other"** — tráfico de interfaz no capturado por `ss`
+- **Velocidad total de interfaz** — desde `psutil.net_io_counters()`
+
+Presione `Ctrl+C` para salir.
+
 ## Precisión
 
 | Componente | Fuente | Precisión |
@@ -135,7 +157,8 @@ Los datos se guardan en `~/.datawall/store.json`:
 red activa (WiFi o ethernet). El loopback (`lo`) se ignora automáticamente.
 
 **El reporte muestra 0 bytes:** El daemon necesita al menos 5 segundos para
-acumular datos después de iniciar.
+acumular datos después de iniciar. `datawall days N` mostrará 0 para
+fechas futuras sin datos.
 
 **"other" tiene un % alto:** Es normal en los primeros muestreos. Con el
 paso de los minutos el porcentaje se estabiliza. Un % alto sostenido

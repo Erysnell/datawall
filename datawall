@@ -178,6 +178,53 @@ def sample_sockdiag() -> list:
     return []
 
 
+def parse_ss_connections(output: str) -> list:
+    sockets = []
+    current = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            parts = line.split()
+            if len(parts) >= 5:
+                local = parts[3]
+                remote = parts[4]
+                if local.startswith('127.') or local.startswith('[::1]'):
+                    if remote.startswith('127.') or remote.startswith('[::1]'):
+                        current = {}
+                        continue
+                current['remote'] = remote
+            m = re.search(r'"([^"]+)",pid=(\d+),fd=(\d+)', line)
+            if m:
+                current['name'] = m.group(1)
+                current['pid'] = int(m.group(2))
+                current['fd'] = int(m.group(3))
+            else:
+                current = {}
+        else:
+            if current and 'name' in current and 'remote' in current:
+                acked = recv = None
+                ma = re.search(r'bytes_acked:(\d+)', line)
+                mr = re.search(r'bytes_received:(\d+)', line)
+                if ma:
+                    acked = int(ma.group(1))
+                if mr:
+                    recv = int(mr.group(1))
+                if acked is not None and recv is not None:
+                    sockets.append((current['pid'], current['fd'], current['name'], current['remote'], acked, recv))
+    return sockets
+
+
+def sample_connections() -> list:
+    try:
+        r = subprocess.run(['ss', '-tpin'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return parse_ss_connections(r.stdout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return []
+
+
 def ss_available() -> bool:
     try:
         subprocess.run(['ss', '-V'], capture_output=True, timeout=3)
@@ -759,6 +806,69 @@ def limit_mode(arg: Optional[str] = None):
         print(f"datawall: daily limit set to {format_bytes(b)}")
 
 
+# ── Connections viewer ──────────────────────────────────────
+
+def show_connections():
+    if not _rich_ok:
+        print("ERROR: 'rich' is required. Install with: pip install rich")
+        sys.exit(1)
+
+    raw = sample_connections()
+    if not raw:
+        console = _RichConsole()
+        console.print("[yellow]No active TCP connections found.[/yellow]")
+        return
+
+    agg = {}
+    prog_totals = {}
+    for _pid, _fd, name, remote, acked, recv in raw:
+        key = (name, remote)
+        if key not in agg:
+            agg[key] = {'sent': 0, 'recv': 0}
+        agg[key]['sent'] += acked
+        agg[key]['recv'] += recv
+        if name not in prog_totals:
+            prog_totals[name] = {'sent': 0, 'recv': 0}
+        prog_totals[name]['sent'] += acked
+        prog_totals[name]['recv'] += recv
+
+    rows = []
+    for (name, remote), data in agg.items():
+        total = data['sent'] + data['recv']
+        pt = prog_totals[name]['sent'] + prog_totals[name]['recv']
+        pct = (total / pt * 100) if pt > 0 else 0
+        rows.append((name, remote, data['sent'], data['recv'], total, pct))
+
+    rows.sort(key=lambda r: r[4], reverse=True)
+
+    console = _RichConsole()
+    table = _RichTable(box=_rich_box.HEAVY, header_style="bold magenta")
+    table.add_column("Program", no_wrap=True)
+    table.add_column("Remote", no_wrap=True)
+    table.add_column("Sent", justify="right", style="yellow")
+    table.add_column("Received", justify="right", style="green")
+    table.add_column("Total", justify="right", style="cyan")
+    table.add_column("%", justify="left")
+
+    for name, remote, sent, recv, total, pct in rows:
+        n = max(1, int(pct / 100 * 10))
+        bar = '█' * n + '░' * (10 - n)
+        table.add_row(
+            name, remote,
+            format_bytes(sent) if sent > 0 else "[dim]—[/dim]",
+            format_bytes(recv) if recv > 0 else "[dim]—[/dim]",
+            format_bytes(total),
+            f"{bar} {pct:5.1f}%"
+        )
+
+    title = _RichText("DataWall — Active Connections", style="bold cyan")
+    panel = _RichPanel(table, title=title, border_style="cyan", padding=(1, 2))
+    console.print()
+    console.print(panel)
+    console.print(f"  {len(rows)} connections across {len(prog_totals)} programs    ")
+    console.print()
+
+
 # ── CLI ─────────────────────────────────────────────────────
 
 def main():
@@ -783,11 +893,12 @@ commands:
   datawall limit        show current daily limit and usage
   datawall limit SIZE   set daily limit (e.g. 5GB, 500MB)
   datawall limit off    remove daily limit
+  datawall connections  show active TCP connections per program
         """
     )
     p.add_argument(
         'command', nargs='?', default='report',
-        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch', 'days', 'limit']
+        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch', 'days', 'limit', 'connections']
     )
     p.add_argument('arg1', nargs='?', type=str, default=None,
                    help=argparse.SUPPRESS)
@@ -822,6 +933,8 @@ commands:
         show_report(days=n)
     elif args.command == 'limit':
         limit_mode(args.arg1)
+    elif args.command == 'connections':
+        show_connections()
     else:
         show_report()
 

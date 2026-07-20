@@ -69,6 +69,7 @@ ln -sf "$PWD/datawall" ~/.local/bin/datawall
 | `datawall limit` | Show daily limit and current usage |
 | `datawall limit SIZE` | Set daily limit (e.g. 5GB, 500MB) |
 | `datawall limit off` | Remove daily limit |
+| `datawall connections` | Show active TCP connections per remote address |
 
 ## Auto-start with systemd
 
@@ -140,6 +141,13 @@ the limit:
 
 The daemon does not enforce the limit — it is a purely visual alert
 in the UI. Use `datawall limit off` to remove it.
+
+### 7. Connections viewer
+
+`datawall connections` takes a snapshot of all active TCP sockets via
+`ss -tpin` and groups them by `(program, remote_address:port)`, showing
+sent/received bytes per remote endpoint with a percentage bar relative
+to the program's total.
 
 ## Accuracy
 

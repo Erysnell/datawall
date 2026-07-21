@@ -202,6 +202,8 @@ datawall/
 ├── datawall.service          # systemd user unit
 ├── Makefile                  # Build helper
 ├── README.md                 # This file
+├── README.es.md              # Spanish documentation
+├── .gitignore
 ├── pkg/
 │   └── debian/
 │       ├── control           # Debian package metadata

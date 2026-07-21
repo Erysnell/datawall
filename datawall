@@ -53,17 +53,21 @@ def parse_bytes(s: str) -> int:
     s = s.strip().lower()
     if s in ('off', 'none', '0'):
         return 0
-    units = {'b': 1, 'kb': 1024, 'mb': 1024**2, 'gb': 1024**3, 'tb': 1024**4}
-    m = re.match(r'^([\d.]+)\s*(' + '|'.join(units) + r')$', s)
-    if m:
-        return int(float(m.group(1)) * units[m.group(2)])
+    units = {'tb': 1024**4, 'gb': 1024**3, 'mb': 1024**2, 'kb': 1024, 'b': 1}
+    for unit, mult in units.items():
+        if s.endswith(unit):
+            rest = s[:-len(unit)].strip()
+            try:
+                return int(float(rest) * mult)
+            except ValueError:
+                raise ValueError(f"invalid size: '{s}' (e.g. 5GB, 500MB, off)")
     try:
         return int(s)
     except ValueError:
         raise ValueError(f"invalid size: '{s}' (e.g. 5GB, 500MB, off)")
 
 
-def log(msg: str):
+def log(msg: str) -> None:
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(LOG_PATH, 'a') as f:
@@ -133,52 +137,7 @@ def get_process_connections() -> dict:
     return result
 
 
-def parse_ss_output(output: str) -> list:
-    sockets = []
-    current = {}
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        if not line[0].isspace():
-            parts = line.split()
-            if len(parts) >= 5:
-                local = parts[3]
-                remote = parts[4]
-                local_is_lo = local.startswith('127.') or local.startswith('[::1]')
-                remote_is_lo = remote.startswith('127.') or remote.startswith('[::1]')
-                if local_is_lo and remote_is_lo:
-                    current = {}
-                    continue
-            m = re.search(r'"([^"]+)",pid=(\d+),fd=(\d+)', line)
-            if m:
-                current = {'name': m.group(1), 'pid': int(m.group(2)), 'fd': int(m.group(3))}
-            else:
-                current = {}
-        else:
-            if current:
-                acked = recv = None
-                ma = re.search(r'bytes_acked:(\d+)', line)
-                mr = re.search(r'bytes_received:(\d+)', line)
-                if ma:
-                    acked = int(ma.group(1))
-                if mr:
-                    recv = int(mr.group(1))
-                if acked is not None and recv is not None:
-                    sockets.append((current['pid'], current['fd'], current['name'], acked, recv))
-    return sockets
-
-
-def sample_sockdiag() -> list:
-    try:
-        r = subprocess.run(['ss', '-tpin'], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return parse_ss_output(r.stdout)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-    return []
-
-
-def parse_ss_connections(output: str) -> list:
+def parse_ss_output(output: str, include_remote: bool = False) -> list:
     sockets = []
     current = {}
     for line in output.splitlines():
@@ -193,7 +152,8 @@ def parse_ss_connections(output: str) -> list:
                     if remote.startswith('127.') or remote.startswith('[::1]'):
                         current = {}
                         continue
-                current['remote'] = remote
+                if include_remote:
+                    current['remote'] = remote
             m = re.search(r'"([^"]+)",pid=(\d+),fd=(\d+)', line)
             if m:
                 current['name'] = m.group(1)
@@ -202,7 +162,9 @@ def parse_ss_connections(output: str) -> list:
             else:
                 current = {}
         else:
-            if current and 'name' in current and 'remote' in current:
+            if current and 'name' in current:
+                if include_remote and 'remote' not in current:
+                    continue
                 acked = recv = None
                 ma = re.search(r'bytes_acked:(\d+)', line)
                 mr = re.search(r'bytes_received:(\d+)', line)
@@ -211,18 +173,25 @@ def parse_ss_connections(output: str) -> list:
                 if mr:
                     recv = int(mr.group(1))
                 if acked is not None and recv is not None:
-                    sockets.append((current['pid'], current['fd'], current['name'], current['remote'], acked, recv))
+                    if include_remote:
+                        sockets.append((current['pid'], current['fd'], current['name'], current['remote'], acked, recv))
+                    else:
+                        sockets.append((current['pid'], current['fd'], current['name'], acked, recv))
     return sockets
 
 
-def sample_connections() -> list:
+def sample_sockdiag(include_remote: bool = False) -> list:
     try:
         r = subprocess.run(['ss', '-tpin'], capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
-            return parse_ss_connections(r.stdout)
+            return parse_ss_output(r.stdout, include_remote=include_remote)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
     return []
+
+
+def sample_connections() -> list:
+    return sample_sockdiag(include_remote=True)
 
 
 def ss_available() -> bool:
@@ -248,7 +217,7 @@ class DataStore:
                 log(f"Corrupted store: {e}")
         return {'days': {}}
 
-    def save(self):
+    def save(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
         try:
@@ -267,7 +236,7 @@ class DataStore:
             }
         return self.data['days'][today]
 
-    def reset_today(self):
+    def reset_today(self) -> None:
         self.data['days'].pop(date.today().isoformat(), None)
         self.save()
 
@@ -287,7 +256,7 @@ class Config:
                 pass
         return {}
 
-    def save(self):
+    def save(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
         try:
@@ -300,11 +269,11 @@ class Config:
         v = self.data.get('daily_limit')
         return v if isinstance(v, int) and v > 0 else None
 
-    def set_daily_limit(self, bytes_val: int):
+    def set_daily_limit(self, bytes_val: int) -> None:
         self.data['daily_limit'] = bytes_val
         self.save()
 
-    def remove_daily_limit(self):
+    def remove_daily_limit(self) -> None:
         self.data.pop('daily_limit', None)
         self.save()
 
@@ -335,7 +304,7 @@ def daemon_status() -> bool:
         return False
 
 
-def daemon_start():
+def daemon_start() -> None:
     if daemon_status():
         print("datawall: daemon is already running")
         return
@@ -359,7 +328,7 @@ def daemon_start():
     daemon_loop()
 
 
-def daemon_run():
+def daemon_run() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     daemon_loop()
@@ -371,7 +340,7 @@ def _daemon_exit(code: int = 0):
     sys.exit(code)
 
 
-def daemon_stop():
+def daemon_stop() -> None:
     if not PID_PATH.exists():
         print("datawall: daemon is not running")
         return
@@ -391,7 +360,7 @@ def daemon_stop():
         _remove_pid()
 
 
-def daemon_loop():
+def daemon_loop() -> None:
     iface = get_active_interface()
     if not iface:
         log("No active network interface found")
@@ -517,14 +486,14 @@ def daemon_loop():
             today['last_rx'] = cur_rx
             today['last_time'] = now
             store.save()
-        except Exception as e:
+        except (OSError, KeyError, TypeError, ValueError) as e:
             log(f"Loop error: {e}")
             time.sleep(5)
 
 
 # ── Reporter ────────────────────────────────────────────────
 
-def show_report(days: Optional[int] = None):
+def show_report(days: Optional[int] = None) -> None:
     if not _rich_ok:
         print("ERROR: 'rich' is required. Install with: pip install rich")
         sys.exit(1)
@@ -628,7 +597,7 @@ def show_report(days: Optional[int] = None):
 
 # ── Watch mode ──────────────────────────────────────────────
 
-def watch_mode():
+def watch_mode() -> None:
     if not _rich_ok:
         print("ERROR: 'rich' is required. Install with: pip install rich")
         sys.exit(1)
@@ -780,7 +749,7 @@ def _limit_warning(total_bytes: int) -> str:
     return ''
 
 
-def limit_mode(arg: Optional[str] = None):
+def limit_mode(arg: Optional[str] = None) -> None:
     cfg = Config()
     if arg is None:
         limit = cfg.get_daily_limit()
@@ -808,7 +777,7 @@ def limit_mode(arg: Optional[str] = None):
 
 # ── Connections viewer ──────────────────────────────────────
 
-def show_connections():
+def show_connections() -> None:
     if not _rich_ok:
         print("ERROR: 'rich' is required. Install with: pip install rich")
         sys.exit(1)
@@ -871,7 +840,7 @@ def show_connections():
 
 # ── CLI ─────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     if psutil is None:
         print("ERROR: 'psutil' is required. Install with: pip install psutil")
         sys.exit(1)

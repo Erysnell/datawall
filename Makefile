@@ -4,7 +4,7 @@ VERSION = $(shell sed -n "s/^VERSION = '\(.*\)'/\1/p" datawall)
 BUILD_DIR = pkg/$(PACKAGE)
 DEB = $(PACKAGE)_$(VERSION)_all.deb
 
-.PHONY: all clean install deb lint version
+.PHONY: all clean install deb lint version test test-all
 
 all: deb
 
@@ -43,6 +43,12 @@ install: datawall datawall.service
 
 clean:
 	rm -rf $(BUILD_DIR) *.deb
+
+test:
+	./tests/run.sh
+
+test-all:
+	./tests/run.sh --all
 
 lint: $(BUILD_DIR)/DEBIAN/control
 	shellcheck $(BUILD_DIR)/DEBIAN/postinst $(BUILD_DIR)/DEBIAN/prerm 2>/dev/null || true

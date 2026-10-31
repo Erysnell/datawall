@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,7 +31,7 @@ try:
 except ImportError:
     _rich_ok = False
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 
 DATA_DIR = Path.home() / '.datawall'
 STORE_PATH = DATA_DIR / 'store.json'
@@ -47,6 +48,9 @@ UNATTRIBUTED = 'unattributed'
 # Runtime bookkeeping that used to be persisted inside each day.
 _VOLATILE_DAY_KEYS = ('last_tx', 'last_rx', 'last_time', 'speed_sent', 'speed_recv')
 DEFAULT_RETENTION_DAYS = 90
+# Percentages of the daily limit that trigger a desktop notification, once
+# per threshold per day.
+DEFAULT_NOTIFY_THRESHOLDS = (80, 100)
 # Re-check which interface carries the default route once a minute, so a VPN
 # going up or down does not leave the daemon reading a dead counter.
 IFACE_RECHECK_EVERY = 12
@@ -101,10 +105,13 @@ def _is_virtual(name: str) -> bool:
     return name.startswith(VIRTUAL_PREFIXES)
 
 
-def _default_route_iface() -> Optional[str]:
-    """Interface holding the IPv4 default route, per /proc/net/route."""
+def _default_route_iface(path: str = '/proc/net/route') -> Optional[str]:
+    """Interface holding the IPv4 default route, per /proc/net/route.
+
+    The path is a parameter so the parsing can be tested against a fixture.
+    """
     try:
-        with open('/proc/net/route') as f:
+        with open(path) as f:
             next(f)  # skip header
             for line in f:
                 parts = line.split()
@@ -448,6 +455,73 @@ class Config:
         v = self.data.get('retention_days')
         return v if isinstance(v, int) and v > 0 else DEFAULT_RETENTION_DAYS
 
+    def notifications_enabled(self) -> bool:
+        return self.data.get('notifications') is not False
+
+    def get_notify_thresholds(self) -> list:
+        """Limit percentages that trigger a notification, ascending."""
+        v = self.data.get('notify_thresholds')
+        if isinstance(v, list):
+            clean = sorted({int(x) for x in v
+                            if isinstance(x, (int, float)) and not isinstance(x, bool)
+                            and 0 < x <= 10000})
+            if clean:
+                return clean
+        return list(DEFAULT_NOTIFY_THRESHOLDS)
+
+
+# ── Notifications ───────────────────────────────────────────
+
+def notify_available() -> bool:
+    return shutil.which('notify-send') is not None
+
+
+def send_notification(title: str, body: str, urgency: str = 'normal') -> bool:
+    """Fire a desktop notification. False if it could not be delivered."""
+    try:
+        r = subprocess.run(
+            ['notify-send', '--app-name=datawall', f'--urgency={urgency}',
+             '--icon=network-transmit-receive', title, body],
+            capture_output=True, timeout=5)
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def check_limit_alerts(day: dict, limit: Optional[int], thresholds: list,
+                       failed: set) -> None:
+    """Notify once per threshold per day when usage crosses it.
+
+    Which thresholds already fired is recorded in the day itself, so it
+    survives a daemon restart and resets on its own at midnight. A threshold
+    is only marked as fired once the notification actually went out, so a
+    transient delivery failure (no session bus yet at boot) is retried.
+    """
+    if not limit or limit <= 0:
+        return
+    total = day.get('total_sent', 0) + day.get('total_recv', 0)
+    if total <= 0:
+        return
+    pct = total / limit * 100
+    fired = day.setdefault('notified', [])
+    for t in thresholds:
+        if pct < t or t in fired:
+            continue
+        if t >= 100:
+            title = 'datawall: daily limit exceeded'
+            urgency = 'critical'
+        else:
+            title = f'datawall: {t}% of daily limit'
+            urgency = 'normal'
+        body = f"{format_bytes(total)} of {format_bytes(limit)} ({pct:.0f}%)"
+        if send_notification(title, body, urgency):
+            fired.append(t)
+            failed.discard(t)
+            log(f"Notified {t}% threshold ({pct:.0f}% used)")
+        elif t not in failed:
+            failed.add(t)  # log once, keep retrying quietly
+            log(f"Threshold {t}% reached but notification could not be sent")
+
 
 # ── Daemon ──────────────────────────────────────────────────
 
@@ -539,10 +613,16 @@ def daemon_loop() -> None:
     log(f"Monitoring interface: {iface}")
 
     store = DataStore()
-    retention = Config().get_retention_days()
+    cfg = Config()
+    retention = cfg.get_retention_days()
     if store.prune(retention):
         log(f"Pruned days older than {retention} days")
         store.save()
+
+    notify_ok = cfg.notifications_enabled() and notify_available()
+    if cfg.notifications_enabled() and not notify_ok:
+        log("notify-send not found; limit notifications disabled")
+    notify_failed = set()
 
     use_ss = ss_available()
     socket_cache = {}
@@ -571,6 +651,8 @@ def daemon_loop() -> None:
             ticks_since_iface_check += 1
             if ticks_since_iface_check >= IFACE_RECHECK_EVERY:
                 ticks_since_iface_check = 0
+                # pick up limit/threshold edits without a restart
+                cfg = Config()
                 detected = get_active_interface()
                 if detected and detected != iface:
                     log(f"Active interface changed: {iface} -> {detected}")
@@ -690,6 +772,10 @@ def daemon_loop() -> None:
                             today['processes'][UNATTRIBUTED] = {'sent': 0, 'recv': 0}
                         today['processes'][UNATTRIBUTED]['sent'] += delta_tx
                         today['processes'][UNATTRIBUTED]['recv'] += delta_rx
+
+            if notify_ok:
+                check_limit_alerts(today, cfg.get_daily_limit(),
+                                   cfg.get_notify_thresholds(), notify_failed)
 
             base = (cur_tx, cur_rx, now)
             store.save()
@@ -1006,7 +1092,16 @@ def limit_mode(arg: Optional[str] = None) -> None:
         total = today.get('total_sent', 0) + today.get('total_recv', 0)
         if limit:
             pct = total / limit * 100
-            print(f"datawall: daily limit: {format_bytes(limit)}  ({format_bytes(total)} used — {pct:.1f}%)")
+            if not cfg.notifications_enabled():
+                state = 'off (disabled in config)'
+            elif not notify_available():
+                state = 'off (notify-send not installed)'
+            else:
+                thresholds = ', '.join(f'{t}%' for t in cfg.get_notify_thresholds())
+                state = f'on at {thresholds}'
+            print(f"datawall: daily limit: {format_bytes(limit)}  "
+                  f"({format_bytes(total)} used — {pct:.1f}%)")
+            print(f"datawall: notifications: {state}")
         else:
             print("datawall: no daily limit set")
         return
@@ -1099,7 +1194,7 @@ def _is_tunnel(name: str) -> bool:
     return name.startswith(TUNNEL_PREFIXES)
 
 
-def _read_proc_counters() -> dict:
+def _read_proc_counters(paths: tuple = ('/proc/net/snmp', '/proc/net/netstat')) -> dict:
     """Protocol counters from /proc/net/snmp and /proc/net/netstat.
 
     System-wide and all-interface: with a VPN up these count both passes of
@@ -1111,7 +1206,7 @@ def _read_proc_counters() -> dict:
         'IpExt': ('InOctets', 'OutOctets'),
     }
     out = {}
-    for path in ('/proc/net/snmp', '/proc/net/netstat'):
+    for path in paths:
         try:
             lines = Path(path).read_text().splitlines()
         except OSError:

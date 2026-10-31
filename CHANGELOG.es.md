@@ -5,6 +5,29 @@ Todos los cambios relevantes de este proyecto se documentan en este archivo.
 El formato sigue [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 y el proyecto adhiere a [Versionado Semántico](https://semver.org/lang/es/).
 
+## [1.2.0] - 2026-10-31
+
+### Agregado
+
+- **Notificaciones de escritorio al cruzar el límite diario.** El daemon
+  dispara `notify-send` al 80% (urgencia normal) y al 100% (crítica), una
+  vez por umbral por día, así el límite ya no depende de que justo corras
+  un comando. Qué umbrales se dispararon se guarda en el día mismo, así que
+  un reinicio no los repite y se rearman a medianoche; un fallo de entrega
+  se reintenta en el ciclo siguiente. Configurable con `notify_thresholds`
+  y `notifications` en `config.json`, y los cambios de límite se toman en
+  menos de 60 segundos sin reiniciar. `libnotify-bin` es un `Recommends`,
+  no una dependencia dura — sin él el daemon lo registra una vez y se queda
+  callado.
+- `datawall limit` ahora informa si las notificaciones están realmente
+  activas y en qué umbrales.
+- Una suite de tests con `unittest` en `tests/` — 147 tests que cubren los
+  parsers de tamaños y de la salida de `ss`, la migración de esquema, la
+  poda por retención, el guardado condicional, todas las claves de config,
+  los umbrales de notificación y la superficie de la CLI, más tests de
+  integración que manejan un daemon real. Sin dependencias de test; se
+  corren con `make test` o `make test-all`.
+
 ## [1.1.0] - 2026-10-31
 
 Release de correcciones y diagnóstico. Todos los comandos de la 1.0.0 siguen
@@ -109,5 +132,6 @@ Primer release empaquetado.
   `status`) y `reset`.
 - Empaquetado Debian y unidad systemd de usuario.
 
+[1.2.0]: https://github.com/Erysnell/datawall/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Erysnell/datawall/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Erysnell/datawall/releases/tag/v1.0.0

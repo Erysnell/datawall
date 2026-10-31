@@ -33,19 +33,20 @@ and current transfer speed.
 | `python3-psutil` | Kernel network counter reader |
 | `python3-rich` | Terminal tables and bars |
 | `iproute2` | `ss` command for exact per-socket data (preinstalled on every Linux) |
+| `libnotify-bin` | *Optional* — `notify-send` for daily-limit notifications |
 
 ## Installation
 
 ### From .deb
 
 ```bash
-sudo apt install ./datawall_1.1.0_all.deb
+sudo apt install ./datawall_1.2.0_all.deb
 ```
 
 Or with dpkg (dependencies must be resolved manually):
 
 ```bash
-sudo dpkg -i datawall_1.1.0_all.deb
+sudo dpkg -i datawall_1.2.0_all.deb
 sudo apt install -f
 ```
 
@@ -172,8 +173,42 @@ the limit:
 - **≥80%**: yellow warning `⚠ Near limit: 4.5 GB / 5.0 GB (90%)`
 - **≥100%**: red warning `⚠ EXCEEDED: 6.2 GB / 5.0 GB (124%)`
 
-The daemon does not enforce the limit — it is a purely visual alert
-in the UI. Use `datawall limit off` to remove it.
+The daemon does not enforce the limit — nothing is throttled or blocked.
+
+**Desktop notifications.** The daemon also fires a `notify-send`
+notification when usage crosses a threshold, once per threshold per day,
+so you find out without having to run a command. 80% is sent at normal
+urgency, 100% at critical so it stays on screen.
+
+Which thresholds have already fired is recorded in the day itself, so a
+daemon restart does not repeat them, and they re-arm on their own at
+midnight (or after a `datawall reset`). A delivery failure — no session
+bus yet at boot, say — is retried on the next cycle rather than
+swallowed.
+
+`datawall limit` reports whether notifications are actually live:
+
+```
+datawall: daily limit: 200.0 MB  (734.3 MB used — 367.2%)
+datawall: notifications: on at 80%, 100%
+```
+
+Both the thresholds and the feature itself are configurable in
+`~/.datawall/config.json`:
+
+```json
+{
+  "daily_limit": 209715200,
+  "notify_thresholds": [50, 80, 100],
+  "notifications": false
+}
+```
+
+Notifications need `notify-send` (package `libnotify-bin` on Debian and
+Ubuntu). Without it the daemon logs the fact once at startup and stays
+quiet. Limit edits are picked up within 60 seconds, no restart needed.
+
+Use `datawall limit off` to remove the limit.
 
 ### 8. Unattributed-traffic diagnostic
 
@@ -256,7 +291,8 @@ when the accumulated bytes actually change:
   "days": {
     "2026-07-13": {
       "total_sent": 26000000,
-      "total_recv": 140200000,
+      "total_recv": 130200000,
+      "notified": [80, 100],
       "processes": {
         "firefox":      { "sent": 15200000, "recv": 82100000 },
         "discord":      { "sent": 2100000,  "recv": 12800000 },
@@ -266,6 +302,11 @@ when the accumulated bytes actually change:
   }
 }
 ```
+
+`notified` records which limit thresholds already fired today, so a
+daemon restart does not repeat them. It is the one piece of per-day state
+kept here rather than in `live.json`, precisely because it has to survive
+a restart.
 
 The `unattributed` bucket was called `other` before 1.1.0. Existing
 stores are migrated automatically on first read, and the counter
@@ -305,6 +346,7 @@ datawall/
 ├── README.es.md              # Spanish documentation
 ├── CHANGELOG.md              # Release notes
 ├── CHANGELOG.es.md           # Spanish release notes
+├── tests/                    # unittest suite (see tests/README.md)
 ├── .gitignore
 ├── pkg/
 │   └── debian/
@@ -313,13 +355,25 @@ datawall/
 │       └── prerm             # Pre-removal script
 ```
 
+### Tests
+
+```bash
+make test        # fast suite: no network, no daemon (~7s)
+make test-all    # adds the integration tests (~4min, needs network)
+```
+
+Plain `unittest` from the standard library, so there are no test
+dependencies. `test_daemon.py` starts a real daemon against a throwaway
+`HOME` and is skipped unless `DATAWALL_SLOW_TESTS=1`. See
+[tests/README.md](tests/README.md).
+
 ### Build .deb
 
 ```bash
 make deb
 ```
 
-Generates `datawall_1.1.0_all.deb`.
+Generates `datawall_1.2.0_all.deb`.
 
 ### Clean
 

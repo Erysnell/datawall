@@ -33,19 +33,20 @@ junto con la velocidad actual.
 | `python3-psutil` | Lectura de contadores de red del kernel |
 | `python3-rich` | Tablas y barras en terminal |
 | `iproute2` | Comando `ss` para datos exactos por socket (viene instalado en todo Linux) |
+| `libnotify-bin` | *Opcional* — `notify-send` para las notificaciones de límite |
 
 ## Instalación
 
 ### Desde el .deb
 
 ```bash
-sudo apt install ./datawall_1.1.0_all.deb
+sudo apt install ./datawall_1.2.0_all.deb
 ```
 
 O con dpkg (las dependencias deben resolverse manualmente):
 
 ```bash
-sudo dpkg -i datawall_1.1.0_all.deb
+sudo dpkg -i datawall_1.2.0_all.deb
 sudo apt install -f
 ```
 
@@ -174,8 +175,44 @@ o supera el límite:
 - **≥80%**: advertencia amarilla `⚠ Near limit: 4.5 GB / 5.0 GB (90%)`
 - **≥100%**: advertencia roja `⚠ EXCEEDED: 6.2 GB / 5.0 GB (124%)`
 
-El daemon no aplica el límite — es solo una alerta visual en la UI.
-Use `datawall limit off` para eliminarlo.
+El daemon no aplica el límite — no se limita ni bloquea nada.
+
+**Notificaciones de escritorio.** El daemon además dispara una
+notificación con `notify-send` cuando el uso cruza un umbral, una vez por
+umbral por día, así te enterás sin tener que correr ningún comando. El 80%
+se manda con urgencia normal y el 100% con urgencia crítica, para que
+quede en pantalla.
+
+Qué umbrales ya se dispararon se guarda en el día mismo, así que un
+reinicio del daemon no los repite, y se rearman solos a medianoche (o
+después de un `datawall reset`). Si la entrega falla —por ejemplo porque
+al arrancar todavía no hay bus de sesión— se reintenta en el ciclo
+siguiente en vez de perderse.
+
+`datawall limit` informa si las notificaciones están realmente activas:
+
+```
+datawall: daily limit: 200.0 MB  (734.3 MB used — 367.2%)
+datawall: notifications: on at 80%, 100%
+```
+
+Los umbrales y la funcionalidad misma se configuran en
+`~/.datawall/config.json`:
+
+```json
+{
+  "daily_limit": 209715200,
+  "notify_thresholds": [50, 80, 100],
+  "notifications": false
+}
+```
+
+Las notificaciones necesitan `notify-send` (paquete `libnotify-bin` en
+Debian y Ubuntu). Sin él, el daemon lo registra una vez al arrancar y se
+queda callado. Los cambios de límite se toman en menos de 60 segundos,
+sin reiniciar.
+
+Use `datawall limit off` para eliminar el límite.
 
 ### 8. Diagnóstico del tráfico no atribuido
 
@@ -260,7 +297,8 @@ La poda corre al arrancar el daemon y de nuevo en cada cambio de fecha.
   "days": {
     "2026-07-13": {
       "total_sent": 26000000,
-      "total_recv": 140200000,
+      "total_recv": 130200000,
+      "notified": [80, 100],
       "processes": {
         "firefox":      { "sent": 15200000, "recv": 82100000 },
         "discord":      { "sent": 2100000,  "recv": 12800000 },
@@ -270,6 +308,11 @@ La poda corre al arrancar el daemon y de nuevo en cada cambio de fecha.
   }
 }
 ```
+
+`notified` registra qué umbrales del límite ya se dispararon hoy, para
+que un reinicio del daemon no los repita. Es el único estado por día que
+vive acá y no en `live.json`, justamente porque tiene que sobrevivir a un
+reinicio.
 
 El bucket `unattributed` se llamaba `other` antes de la 1.1.0. Los stores
 existentes se migran automáticamente en la primera lectura, y las líneas
@@ -309,6 +352,7 @@ datawall/
 ├── README.es.md              # Documentación en español (este archivo)
 ├── CHANGELOG.md              # Notas de release
 ├── CHANGELOG.es.md           # Notas de release en español
+├── tests/                    # suite de unittest (ver tests/README.md)
 ├── .gitignore
 ├── pkg/
 │   └── debian/
@@ -317,13 +361,25 @@ datawall/
 │       └── prerm             # Pre-eliminación
 ```
 
+### Tests
+
+```bash
+make test        # suite rápida: sin red, sin daemon (~7s)
+make test-all    # agrega los de integración (~4min, necesita red)
+```
+
+Usa `unittest` de la biblioteca estándar, así que no hay dependencias de
+test. `test_daemon.py` arranca un daemon real contra un `HOME` descartable
+y se saltea salvo que definas `DATAWALL_SLOW_TESTS=1`. Ver
+[tests/README.md](tests/README.md).
+
 ### Construir el .deb
 
 ```bash
 make deb
 ```
 
-Genera `datawall_1.1.0_all.deb`.
+Genera `datawall_1.2.0_all.deb`.
 
 ### Limpiar
 

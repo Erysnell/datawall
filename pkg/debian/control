@@ -1,8 +1,9 @@
 Package: datawall
-Version: 1.1.0
+Version: 1.2.0
 Architecture: all
 Maintainer: Erysnell Gonzalez
 Depends: python3, python3-psutil, python3-rich, iproute2
+Recommends: libnotify-bin
 Description: Track daily network usage per program
  datawall runs a lightweight background daemon that samples
  network traffic and attributes it to active processes.
@@ -20,3 +21,4 @@ Description: Track daily network usage per program
    * Daily traffic limit with visual alerts (datawall limit)
    * Live TCP connections viewer (datawall connections)
    * Diagnostic for unattributed traffic (datawall explain)
+   * Desktop notifications when the daily limit is crossed

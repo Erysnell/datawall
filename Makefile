@@ -1,11 +1,16 @@
 PACKAGE = datawall
-VERSION = 1.0.0
+# Single source of truth: the VERSION constant inside the script itself.
+VERSION = $(shell sed -n "s/^VERSION = '\(.*\)'/\1/p" datawall)
 BUILD_DIR = pkg/$(PACKAGE)
 DEB = $(PACKAGE)_$(VERSION)_all.deb
 
-.PHONY: all clean install deb lint
+.PHONY: all clean install deb lint version
 
 all: deb
+
+version:
+	@test -n "$(VERSION)" || { echo "ERROR: could not read VERSION from datawall"; exit 1; }
+	@echo "$(PACKAGE) $(VERSION)"
 
 $(BUILD_DIR)/usr/bin/datawall: datawall
 	mkdir -p $(BUILD_DIR)/usr/bin
@@ -16,14 +21,14 @@ $(BUILD_DIR)/usr/lib/systemd/user/datawall.service: datawall.service
 	mkdir -p $(BUILD_DIR)/usr/lib/systemd/user
 	cp datawall.service $(BUILD_DIR)/usr/lib/systemd/user/datawall.service
 
-$(BUILD_DIR)/DEBIAN/control: pkg/debian/control pkg/debian/postinst pkg/debian/prerm
+$(BUILD_DIR)/DEBIAN/control: pkg/debian/control pkg/debian/postinst pkg/debian/prerm datawall
 	mkdir -p $(BUILD_DIR)/DEBIAN
-	cp pkg/debian/control $(BUILD_DIR)/DEBIAN/control
+	sed 's/^Version:.*/Version: $(VERSION)/' pkg/debian/control > $(BUILD_DIR)/DEBIAN/control
 	cp pkg/debian/postinst $(BUILD_DIR)/DEBIAN/postinst
 	cp pkg/debian/prerm $(BUILD_DIR)/DEBIAN/prerm
 	chmod 755 $(BUILD_DIR)/DEBIAN/postinst $(BUILD_DIR)/DEBIAN/prerm
 
-deb: $(BUILD_DIR)/usr/bin/datawall $(BUILD_DIR)/usr/lib/systemd/user/datawall.service $(BUILD_DIR)/DEBIAN/control
+deb: version $(BUILD_DIR)/usr/bin/datawall $(BUILD_DIR)/usr/lib/systemd/user/datawall.service $(BUILD_DIR)/DEBIAN/control
 	dpkg-deb --build -Zxz $(BUILD_DIR) $(DEB)
 	@echo ""
 	@echo "Package built: $(DEB)"
@@ -39,6 +44,6 @@ install: datawall datawall.service
 clean:
 	rm -rf $(BUILD_DIR) *.deb
 
-lint: $(BUILD_DIR)/usr/bin/datawall
+lint: $(BUILD_DIR)/DEBIAN/control
 	shellcheck $(BUILD_DIR)/DEBIAN/postinst $(BUILD_DIR)/DEBIAN/prerm 2>/dev/null || true
 	pyflakes3 datawall 2>/dev/null || true

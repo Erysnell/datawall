@@ -25,16 +25,31 @@ try:
     from rich.table import Table as _RichTable
     from rich.text import Text as _RichText
     from rich.panel import Panel as _RichPanel
+    from rich.padding import Padding as _RichPadding
     _rich_ok = True
 except ImportError:
     _rich_ok = False
+
+VERSION = '1.1.0'
 
 DATA_DIR = Path.home() / '.datawall'
 STORE_PATH = DATA_DIR / 'store.json'
 PID_PATH = DATA_DIR / 'daemon.pid'
 LOG_PATH = DATA_DIR / 'daemon.log'
 CONFIG_PATH = DATA_DIR / 'config.json'
+# Volatile daemon state (current speed, monitored interface). Kept out of
+# store.json so the history file is only written when bytes actually move.
+LIVE_PATH = DATA_DIR / 'live.json'
 SAMPLE_INTERVAL = 5
+# Bucket for interface bytes that no visible TCP socket could explain.
+# `datawall explain` breaks down where it comes from.
+UNATTRIBUTED = 'unattributed'
+# Runtime bookkeeping that used to be persisted inside each day.
+_VOLATILE_DAY_KEYS = ('last_tx', 'last_rx', 'last_time', 'speed_sent', 'speed_recv')
+DEFAULT_RETENTION_DAYS = 90
+# Re-check which interface carries the default route once a minute, so a VPN
+# going up or down does not leave the daemon reading a dead counter.
+IFACE_RECHECK_EVERY = 12
 
 
 def format_bytes(n: float) -> str:
@@ -78,7 +93,36 @@ def log(msg: str) -> None:
 
 # ── Network helpers ──────────────────────────────────────────
 
+# Container, bridge and loopback interfaces never carry the real uplink.
+VIRTUAL_PREFIXES = ('lo', 'docker', 'br-', 'virbr', 'veth', 'vmnet', 'vboxnet')
+
+
+def _is_virtual(name: str) -> bool:
+    return name.startswith(VIRTUAL_PREFIXES)
+
+
+def _default_route_iface() -> Optional[str]:
+    """Interface holding the IPv4 default route, per /proc/net/route."""
+    try:
+        with open('/proc/net/route') as f:
+            next(f)  # skip header
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == '00000000':
+                    return parts[0]
+    except (OSError, StopIteration):
+        pass
+    return None
+
+
 def get_active_interface() -> Optional[str]:
+    """Pick the interface carrying real traffic.
+
+    Preference order: explicit config override, then the default-route
+    interface, then any non-virtual interface with traffic, then any
+    non-virtual interface that is up. Picking by dict order alone used to
+    land on whichever NIC psutil happened to list first.
+    """
     try:
         counters = psutil.net_io_counters(pernic=True)
     except Exception as e:
@@ -89,33 +133,51 @@ def get_active_interface() -> Optional[str]:
     except Exception as e:
         log(f"get_active_interface stats error: {e}")
         stats = {}
+
+    override = Config().get_interface()
+    if override:
+        if override in counters or override in stats:
+            return override
+        log(f"Configured interface '{override}' not found, auto-detecting")
+
+    route_iface = _default_route_iface()
+    if route_iface and (route_iface in counters or route_iface in stats):
+        return route_iface
+
     for name in counters:
-        if name != 'lo' and (counters[name].bytes_sent > 0 or counters[name].bytes_recv > 0):
+        if not _is_virtual(name) and (counters[name].bytes_sent > 0 or counters[name].bytes_recv > 0):
             return name
     for name in stats:
-        if name != 'lo' and stats[name].isup:
+        if not _is_virtual(name) and stats[name].isup:
             return name
     log(f"Interfaces available: {list(counters.keys())}")
-    log(f"Interfaces up: {[k for k,v in stats.items() if v.isup]}")
+    log(f"Interfaces up: {[k for k, v in stats.items() if v.isup]}")
     return None
 
 
-def get_interface_counters(iface: str) -> tuple:
+def get_interface_counters(iface: str) -> Optional[tuple]:
+    """Return (bytes_sent, bytes_recv), or None if the interface is gone.
+
+    None rather than (0, 0): a zero baseline stored on a transient failure
+    gets read back next sample as a multi-gigabyte delta.
+    """
     try:
         counters = psutil.net_io_counters(pernic=True)
         if iface in counters:
             c = counters[iface]
             return c.bytes_sent, c.bytes_recv
-    except Exception:
-        pass
-    return 0, 0
+    except Exception as e:
+        log(f"get_interface_counters error: {e}")
+    return None
 
 
 def get_current_speed(iface: str) -> tuple:
-    s1, r1 = get_interface_counters(iface)
+    c1 = get_interface_counters(iface)
     time.sleep(1)
-    s2, r2 = get_interface_counters(iface)
-    return max(0.0, float(s2 - s1)), max(0.0, float(r2 - r1))
+    c2 = get_interface_counters(iface)
+    if c1 is None or c2 is None:
+        return 0.0, 0.0
+    return max(0.0, float(c2[0] - c1[0])), max(0.0, float(c2[1] - c1[1]))
 
 
 def get_process_connections() -> dict:
@@ -204,25 +266,127 @@ def ss_available() -> bool:
 
 # ── Data store ──────────────────────────────────────────────
 
+def _migrate(data: dict) -> dict:
+    """Bring an on-disk store up to the current schema, in place.
+
+    Idempotent: runs on every load, including the daemon's reloads.
+    """
+    days = data.setdefault('days', {})
+    for day in days.values():
+        if not isinstance(day, dict):
+            continue
+        # 'other' was renamed to make the bucket self-describing
+        procs = day.get('processes')
+        if isinstance(procs, dict) and 'other' in procs:
+            old = procs.pop('other')
+            dst = procs.setdefault(UNATTRIBUTED, {'sent': 0, 'recv': 0})
+            dst['sent'] += old.get('sent', 0)
+            dst['recv'] += old.get('recv', 0)
+        # counter baselines and speeds are runtime state, not history
+        for k in _VOLATILE_DAY_KEYS:
+            day.pop(k, None)
+    return data
+
+
+def write_live_state(iface: Optional[str], speed_sent: float, speed_recv: float) -> None:
+    """Publish the daemon's current speed for readers (report, status)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = LIVE_PATH.with_suffix('.tmp')
+    try:
+        tmp.write_text(json.dumps({
+            'iface': iface,
+            'speed_sent': round(speed_sent, 1),
+            'speed_recv': round(speed_recv, 1),
+            'time': time.time(),
+        }))
+        tmp.replace(LIVE_PATH)
+    except OSError as e:
+        log(f"Live state write error: {e}")
+
+
+def read_live_state(max_age: float) -> Optional[dict]:
+    """The daemon's last published speed, or None if missing or stale."""
+    try:
+        d = json.loads(LIVE_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    ts = d.get('time')
+    if not isinstance(ts, (int, float)) or time.time() - ts > max_age:
+        return None
+    if not all(isinstance(d.get(k), (int, float)) for k in ('speed_sent', 'speed_recv')):
+        return None
+    return d
+
+
 class DataStore:
     def __init__(self):
         self.path = STORE_PATH
+        # read the mtime BEFORE the contents: a write landing in between then
+        # looks newer than us and triggers a harmless reload, whereas the
+        # reverse order would silently miss it
+        self._mtime = self._disk_mtime()
         self.data = self._load()
+        self._saved = None  # last payload written, for save() short-circuit
+
+    def _disk_mtime(self) -> Optional[int]:
+        try:
+            return self.path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def reload_if_changed(self) -> bool:
+        """Re-read the store if another process wrote it (e.g. `datawall reset`).
+
+        The daemon keeps one DataStore for its whole lifetime. Without this it
+        holds a stale in-memory copy and writes the reset day straight back.
+        """
+        current = self._disk_mtime()
+        if current != self._mtime:
+            self._mtime = current
+            self.data = self._load()
+            return True
+        return False
 
     def _load(self) -> dict:
         if self.path.exists():
             try:
-                return json.loads(self.path.read_text())
+                return _migrate(json.loads(self.path.read_text()))
             except (json.JSONDecodeError, OSError) as e:
                 log(f"Corrupted store: {e}")
         return {'days': {}}
 
+    def prune(self, keep_days: int) -> int:
+        """Drop days older than the retention window. Returns how many went."""
+        if keep_days < 1:
+            return 0
+        cutoff = (date.today() - timedelta(days=keep_days - 1)).isoformat()
+        stale = [d for d in self.data['days'] if d < cutoff]
+        for d in stale:
+            del self.data['days'][d]
+        return len(stale)
+
     def save(self) -> None:
+        """Write the store, skipping the write when nothing changed.
+
+        The daemon saves every 5s forever; now that volatile state lives in
+        live.json, an idle link produces identical content and no disk write.
+        """
+        try:
+            payload = json.dumps(self.data, indent=2)
+        except (TypeError, ValueError) as e:
+            log(f"Serialize error: {e}")
+            return
+        if payload == self._saved:
+            return
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
         try:
-            tmp.write_text(json.dumps(self.data, indent=2))
+            tmp.write_text(payload)
             tmp.replace(self.path)
+            self._saved = payload
+            self._mtime = self._disk_mtime()
         except OSError as e:
             log(f"Save error: {e}")
 
@@ -232,7 +396,6 @@ class DataStore:
             self.data['days'][today] = {
                 'total_sent': 0, 'total_recv': 0,
                 'processes': {},
-                'speed_sent': 0.0, 'speed_recv': 0.0,
             }
         return self.data['days'][today]
 
@@ -276,6 +439,14 @@ class Config:
     def remove_daily_limit(self) -> None:
         self.data.pop('daily_limit', None)
         self.save()
+
+    def get_interface(self) -> Optional[str]:
+        v = self.data.get('interface')
+        return v if isinstance(v, str) and v else None
+
+    def get_retention_days(self) -> int:
+        v = self.data.get('retention_days')
+        return v if isinstance(v, int) and v > 0 else DEFAULT_RETENTION_DAYS
 
 
 # ── Daemon ──────────────────────────────────────────────────
@@ -368,44 +539,82 @@ def daemon_loop() -> None:
     log(f"Monitoring interface: {iface}")
 
     store = DataStore()
+    retention = Config().get_retention_days()
+    if store.prune(retention):
+        log(f"Pruned days older than {retention} days")
+        store.save()
+
     use_ss = ss_available()
     socket_cache = {}
+    # Counter baseline, deliberately daemon-local: a restart re-seeds instead
+    # of attributing everything that moved while nothing was watching.
+    base = None
+    ticks_since_iface_check = 0
+    pruned_on = date.today()
     if use_ss:
         log("Using SOCK_DIAG (ss) for exact per-process tracking")
 
     while True:
         time.sleep(SAMPLE_INTERVAL)
         try:
+            # `datawall reset` writes the store from another process; without
+            # re-reading it here we would overwrite the reset within 5s
+            if store.reload_if_changed():
+                log("Store changed on disk, reloaded")
             today = store.get_today()
-            cur_tx, cur_rx = get_interface_counters(iface)
+
+            if date.today() != pruned_on:
+                pruned_on = date.today()
+                if store.prune(retention):
+                    log(f"Pruned days older than {retention} days")
+
+            ticks_since_iface_check += 1
+            if ticks_since_iface_check >= IFACE_RECHECK_EVERY:
+                ticks_since_iface_check = 0
+                detected = get_active_interface()
+                if detected and detected != iface:
+                    log(f"Active interface changed: {iface} -> {detected}")
+                    iface = detected
+                    base = None
+                    socket_cache.clear()
+
+            counters = get_interface_counters(iface)
+            if counters is None:
+                # Interface vanished (unplugged, VPN down, renamed). Re-detect
+                # and drop the baseline rather than storing zeros, which the
+                # next sample would read back as a huge bogus delta.
+                detected = get_active_interface()
+                if detected and detected != iface:
+                    log(f"Interface {iface} gone, switching to {detected}")
+                    iface = detected
+                else:
+                    log(f"Interface {iface} unavailable, waiting")
+                base = None
+                socket_cache.clear()
+                write_live_state(iface, 0.0, 0.0)
+                continue
+            cur_tx, cur_rx = counters
             now = time.time()
 
-            if 'last_tx' not in today:
-                today['last_tx'] = cur_tx
-                today['last_rx'] = cur_rx
-                today['last_time'] = now
-                today['speed_sent'] = 0.0
-                today['speed_recv'] = 0.0
-                store.save()
-                continue
-
-            elapsed = now - today['last_time']
-            if elapsed > SAMPLE_INTERVAL * 3:
-                today['last_tx'] = cur_tx
-                today['last_rx'] = cur_rx
-                today['last_time'] = now
-                today['speed_sent'] = 0.0
-                today['speed_recv'] = 0.0
+            if base is None:
+                base = (cur_tx, cur_rx, now)
                 socket_cache.clear()
-                log(f"Large gap detected ({elapsed:.0f}s), resetting baseline")
-                store.save()
+                write_live_state(iface, 0.0, 0.0)
                 continue
 
-            delta_tx = max(0, cur_tx - today['last_tx'])
-            delta_rx = max(0, cur_rx - today['last_rx'])
+            last_tx, last_rx, last_time = base
+            elapsed = now - last_time
+            if elapsed > SAMPLE_INTERVAL * 3:
+                log(f"Large gap detected ({elapsed:.0f}s), resetting baseline")
+                base = (cur_tx, cur_rx, now)
+                socket_cache.clear()
+                write_live_state(iface, 0.0, 0.0)
+                continue
+
+            delta_tx = max(0, cur_tx - last_tx)
+            delta_rx = max(0, cur_rx - last_rx)
             interval = max(elapsed, 0.1)
-            today['speed_sent'] = round(delta_tx / interval, 1)
-            today['speed_recv'] = round(delta_rx / interval, 1)
+            write_live_state(iface, delta_tx / interval, delta_rx / interval)
 
             if delta_tx > 0 or delta_rx > 0:
                 today['total_sent'] += delta_tx
@@ -461,10 +670,10 @@ def daemon_loop() -> None:
                     remaining_tx = max(0, delta_tx - tracked_tx)
                     remaining_rx = max(0, delta_rx - tracked_rx)
                     if remaining_tx > 0 or remaining_rx > 0:
-                        if 'other' not in today['processes']:
-                            today['processes']['other'] = {'sent': 0, 'recv': 0}
-                        today['processes']['other']['sent'] += remaining_tx
-                        today['processes']['other']['recv'] += remaining_rx
+                        if UNATTRIBUTED not in today['processes']:
+                            today['processes'][UNATTRIBUTED] = {'sent': 0, 'recv': 0}
+                        today['processes'][UNATTRIBUTED]['sent'] += remaining_tx
+                        today['processes'][UNATTRIBUTED]['recv'] += remaining_rx
                 else:
                     active = get_process_connections()
                     total_conns = sum(p['connections'] for p in active.values())
@@ -477,14 +686,12 @@ def daemon_loop() -> None:
                             today['processes'][nm]['sent'] += int(delta_tx * w)
                             today['processes'][nm]['recv'] += int(delta_rx * w)
                     else:
-                        if 'other' not in today['processes']:
-                            today['processes']['other'] = {'sent': 0, 'recv': 0}
-                        today['processes']['other']['sent'] += delta_tx
-                        today['processes']['other']['recv'] += delta_rx
+                        if UNATTRIBUTED not in today['processes']:
+                            today['processes'][UNATTRIBUTED] = {'sent': 0, 'recv': 0}
+                        today['processes'][UNATTRIBUTED]['sent'] += delta_tx
+                        today['processes'][UNATTRIBUTED]['recv'] += delta_rx
 
-            today['last_tx'] = cur_tx
-            today['last_rx'] = cur_rx
-            today['last_time'] = now
+            base = (cur_tx, cur_rx, now)
             store.save()
         except (OSError, KeyError, TypeError, ValueError) as e:
             log(f"Loop error: {e}")
@@ -528,7 +735,8 @@ def show_report(days: Optional[int] = None) -> None:
         end_date = date_strings[0]
         title = _RichText(f"DataWall — Last {days} days ({start_date} → {end_date})", style="bold cyan")
         sub = f"Days with data: {days_with_data}/{days}"
-        show_avg = True
+        # no matching days means no average to show (and no divisor)
+        show_avg = days_with_data > 0
     else:
         # ── single-day report ──
         today = store.get_today()
@@ -537,10 +745,17 @@ def show_report(days: Optional[int] = None) -> None:
         total_all = total_sent + total_recv
         procs = today.get('processes', {})
         title = _RichText(f"DataWall — {date.today().isoformat()}", style="bold cyan")
-        iface = get_active_interface()
+        # the daemon samples speed every 5s already; reuse it rather than
+        # blocking the report for a second to measure it again
+        live = read_live_state(SAMPLE_INTERVAL * 3)
+        if live:
+            iface = live.get('iface')
+            up, down = live['speed_sent'], live['speed_recv']
+        else:
+            iface = get_active_interface()
+            up, down = get_current_speed(iface) if iface else (0.0, 0.0)
         if iface:
-            up, down = get_current_speed(iface)
-            sub = f"Speed:  ↑ {format_speed(up)}  ↓ {format_speed(down)}   [{iface}]"
+            sub = f"Speed:  ↑ {format_speed(up)}  ↓ {format_speed(down)}   \\[{iface}]"
         else:
             sub = "Speed:  [dim]not available[/dim]"
         sub = _limit_warning(total_all) + sub
@@ -588,6 +803,14 @@ def show_report(days: Optional[int] = None) -> None:
     console.print()
     console.print(panel)
 
+    un = procs.get(UNATTRIBUTED, {})
+    un_total = un.get('sent', 0) + un.get('recv', 0)
+    if total_all > 0 and un_total / total_all >= 0.15:
+        console.print(
+            f"  [dim]'{UNATTRIBUTED}' is {un_total / total_all * 100:.0f}% — run[/dim]"
+            f" datawall explain [dim]for the breakdown[/dim]"
+        )
+
     if not days:
         running = daemon_status()
         sc = "green" if running else "red"
@@ -603,7 +826,6 @@ def watch_mode() -> None:
         sys.exit(1)
 
     iface = get_active_interface()
-    daemon_alive = daemon_status()
     console = _RichConsole()
 
     speed_cache = {}
@@ -616,10 +838,8 @@ def watch_mode() -> None:
                 time.sleep(interval)
 
                 cur_ss = sample_sockdiag()
-                if iface:
-                    cur_tx, cur_rx = get_interface_counters(iface)
-                else:
-                    cur_tx = cur_rx = 0
+                daemon_alive = daemon_status()
+                counters = get_interface_counters(iface) if iface else None
 
                 # per-process speeds from socket cache
                 proc_speed = {}
@@ -652,10 +872,15 @@ def watch_mode() -> None:
                     proc_speed[name]['tx'] /= interval
                     proc_speed[name]['rx'] /= interval
 
-                # interface deltas in this interval
-                iface_tx = cur_tx - old_tx if old_tx is not None else 0
-                iface_rx = cur_rx - old_rx if old_rx is not None else 0
-                old_tx, old_rx = cur_tx, cur_rx
+                # interface deltas in this interval; a missing interface or a
+                # counter reset reports no delta rather than a negative one
+                if counters is None:
+                    iface_tx = iface_rx = 0
+                else:
+                    cur_tx, cur_rx = counters
+                    iface_tx = max(0, cur_tx - old_tx) if old_tx is not None else 0
+                    iface_rx = max(0, cur_rx - old_rx) if old_rx is not None else 0
+                    old_tx, old_rx = cur_tx, cur_rx
 
                 # timing correction
                 if ss_tx > iface_tx and ss_tx > 0:
@@ -669,11 +894,11 @@ def watch_mode() -> None:
                         proc_speed[name]['rx'] *= scale
                     ss_rx = iface_rx
 
-                # residual "other" speed
-                other_tx = max(0.0, iface_tx / interval - ss_tx / interval) if old_tx is not None else 0.0
-                other_rx = max(0.0, iface_rx / interval - ss_rx / interval) if old_rx is not None else 0.0
+                # residual "other" speed: interface bytes no TCP socket explained
+                other_tx = max(0.0, (iface_tx - ss_tx) / interval)
+                other_rx = max(0.0, (iface_rx - ss_rx) / interval)
                 if other_tx > 0 or other_rx > 0:
-                    proc_speed['other'] = {'tx': other_tx, 'rx': other_rx}
+                    proc_speed[UNATTRIBUTED] = {'tx': other_tx, 'rx': other_rx}
 
                 # daily totals from store (reload each iteration to pick up daemon updates)
                 today = DataStore().get_today()
@@ -702,7 +927,16 @@ def watch_mode() -> None:
                     pct = (pt / total_all * 100) if total_all > 0 else 0
                     rows.append((name, tx, rx, pt, pct))
 
-                rows.sort(key=lambda r: r[4] if r[3] > 0 else r[1] + r[2], reverse=True)
+                # one comparable key: bytes used today, tie-broken by live
+                # speed so a brand-new talker still outranks idle processes.
+                # (The old key mixed percentages with bytes/s.)
+                rows.sort(key=lambda r: (r[3], r[1] + r[2]), reverse=True)
+
+                # Live(screen=True) crops silently and cannot scroll, so the
+                # table has to fit the terminal; the rest is folded into one row
+                body_height = max(3, console.size.height - 11)
+                hidden = rows[body_height:]
+                rows = rows[:body_height]
 
                 for name, tx, rx, pt, pct in rows:
                     n = max(1, int(pct / 100 * 10))
@@ -715,8 +949,22 @@ def watch_mode() -> None:
                         f"{bar} {pct:5.1f}%" if pt > 0 else ""
                     )
 
-                total_tx_speed = (iface_tx / interval) if old_tx is not None else 0.0
-                total_rx_speed = (iface_rx / interval) if old_rx is not None else 0.0
+                if hidden:
+                    h_tx = sum(r[1] for r in hidden)
+                    h_rx = sum(r[2] for r in hidden)
+                    h_pt = sum(r[3] for r in hidden)
+                    h_pct = sum(r[4] for r in hidden)
+                    n = max(1, min(10, int(h_pct / 100 * 10)))
+                    table.add_row(
+                        f"[dim]… +{len(hidden)} more[/dim]",
+                        f"[dim]{format_speed(h_rx)}[/dim]" if h_rx > 0 else "[dim]—[/dim]",
+                        f"[dim]{format_speed(h_tx)}[/dim]" if h_tx > 0 else "[dim]—[/dim]",
+                        f"[dim]{format_bytes(h_pt)}[/dim]",
+                        f"[dim]{'█' * n}{'░' * (10 - n)} {h_pct:5.1f}%[/dim]" if h_pt > 0 else ""
+                    )
+
+                total_tx_speed = iface_tx / interval
+                total_rx_speed = iface_rx / interval
                 table.add_row(
                     "[bold]TOTAL[/bold]",
                     f"[bold]{format_speed(total_rx_speed)}[/bold]",
@@ -838,6 +1086,239 @@ def show_connections() -> None:
     console.print()
 
 
+# ── Unattributed-traffic diagnostic ─────────────────────────
+
+# VPN / tunnel interfaces: traffic crossing one is counted twice system-wide,
+# once as tunnel payload and once encapsulated on the physical underlay.
+TUNNEL_PREFIXES = ('tun', 'tap', 'wg', 'ppp', 'nordlynx', 'proton', 'zt')
+# IPv4 header + TCP header with typical options, per segment.
+TCP_HEADER_BYTES = 52
+
+
+def _is_tunnel(name: str) -> bool:
+    return name.startswith(TUNNEL_PREFIXES)
+
+
+def _read_proc_counters() -> dict:
+    """Protocol counters from /proc/net/snmp and /proc/net/netstat.
+
+    System-wide and all-interface: with a VPN up these count both passes of
+    the same payload, so they are only good for protocol *mix*, not volume.
+    """
+    wanted = {
+        'Tcp': ('InSegs', 'OutSegs'),
+        'Udp': ('InDatagrams', 'OutDatagrams'),
+        'IpExt': ('InOctets', 'OutOctets'),
+    }
+    out = {}
+    for path in ('/proc/net/snmp', '/proc/net/netstat'):
+        try:
+            lines = Path(path).read_text().splitlines()
+        except OSError:
+            continue
+        headers = {}
+        for line in lines:
+            proto, sep, rest = line.partition(':')
+            if not sep or proto not in wanted:
+                continue
+            fields = rest.split()
+            if proto not in headers:
+                headers[proto] = fields  # first occurrence names the columns
+                continue
+            for field in wanted[proto]:
+                if field in headers[proto]:
+                    idx = headers[proto].index(field)
+                    if idx < len(fields):
+                        try:
+                            out[f'{proto}.{field}'] = int(fields[idx])
+                        except ValueError:
+                            pass
+            del headers[proto]
+    return out
+
+
+def _socket_ownership() -> tuple:
+    """(sockets with no owning PID, total sockets) as `ss` sees them.
+
+    Without privileges the kernel hides other users' socket owners, so their
+    traffic can never be attributed to a program.
+    """
+    try:
+        r = subprocess.run(['ss', '-tpn'], capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 0, 0
+    total = unowned = 0
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] in ('State', 'Netid'):
+            continue
+        total += 1
+        if 'users:((' not in line:
+            unowned += 1
+    return unowned, total
+
+
+def show_explain(window: float = 4.0) -> None:
+    """Measure where the unattributed bytes actually come from, right now."""
+    if not _rich_ok:
+        print("ERROR: 'rich' is required. Install with: pip install rich")
+        sys.exit(1)
+
+    console = _RichConsole()
+    iface = get_active_interface()
+    if not iface:
+        console.print("[red]No active network interface found.[/red]")
+        return
+
+    try:
+        all_counters = psutil.net_io_counters(pernic=True)
+    except Exception:
+        all_counters = {}
+    route_iface = _default_route_iface()
+    tunnels = [n for n in all_counters
+               if _is_tunnel(n) and (all_counters[n].bytes_sent or all_counters[n].bytes_recv)]
+
+    # ── sample ──
+    console.print(f"\n  Sampling [cyan]{iface}[/cyan] for {window:.0f}s...")
+    before_ss = {(pid, fd): (a, r) for pid, fd, _n, a, r in sample_sockdiag()}
+    c0 = get_interface_counters(iface)
+    p0 = _read_proc_counters()
+    time.sleep(window)
+    p1 = _read_proc_counters()
+    c1 = get_interface_counters(iface)
+    after_ss = sample_sockdiag()
+
+    if c0 is None or c1 is None:
+        console.print(f"[red]Interface {iface} disappeared while sampling.[/red]")
+        return
+
+    iface_tx = max(0, c1[0] - c0[0])
+    iface_rx = max(0, c1[1] - c0[1])
+    iface_total = iface_tx + iface_rx
+
+    tracked_tx = tracked_rx = 0
+    for pid, fd, _name, acked, recv in after_ss:
+        prev = before_ss.get((pid, fd))
+        if prev is None:
+            # Not present at the start, so this socket opened during the window
+            # and its whole lifetime counter falls inside it. Skipping these
+            # made short-window attribution look far worse than it is.
+            tracked_tx += acked
+            tracked_rx += recv
+        elif acked >= prev[0] and recv >= prev[1]:
+            tracked_tx += acked - prev[0]
+            tracked_rx += recv - prev[1]
+    tracked_tx = min(tracked_tx, iface_tx)
+    tracked_rx = min(tracked_rx, iface_rx)
+    tracked_total = tracked_tx + tracked_rx
+    unattr_total = max(0, iface_total - tracked_total)
+
+    def delta(key):
+        a, b = p0.get(key), p1.get(key)
+        return max(0, b - a) if isinstance(a, int) and isinstance(b, int) else None
+
+    tcp_segs = delta('Tcp.InSegs'), delta('Tcp.OutSegs')
+    udp_dgrams = delta('Udp.InDatagrams'), delta('Udp.OutDatagrams')
+    seg_count = sum(s for s in tcp_segs if s) or 0
+    dgram_count = sum(d for d in udp_dgrams if d) or 0
+    hdr_estimate = seg_count * TCP_HEADER_BYTES
+
+    def pct(n):
+        return f"{n / iface_total * 100:5.1f}%" if iface_total > 0 else "    —"
+
+    # ── measured attribution ──
+    t1 = _RichTable(box=_rich_box.SIMPLE, header_style="bold magenta", pad_edge=False)
+    t1.add_column("Measured over the sample")
+    t1.add_column("Sent", justify="right", style="yellow")
+    t1.add_column("Received", justify="right", style="green")
+    t1.add_column("Total", justify="right", style="cyan")
+    t1.add_column("Share", justify="right")
+    t1.add_row(f"Interface {iface}", format_bytes(iface_tx), format_bytes(iface_rx),
+               format_bytes(iface_total), pct(iface_total))
+    t1.add_row("Attributed to TCP sockets", format_bytes(tracked_tx), format_bytes(tracked_rx),
+               format_bytes(tracked_total), pct(tracked_total))
+    t1.add_row(f"[bold]{UNATTRIBUTED}[/bold]", "", "",
+               f"[bold]{format_bytes(unattr_total)}[/bold]", f"[bold]{pct(unattr_total)}[/bold]")
+    console.print(_RichPanel(t1, title=_RichText("Where the bytes went", style="bold cyan"),
+                             border_style="cyan", padding=(1, 2)))
+
+    # ── protocol mix ──
+    t2 = _RichTable(box=_rich_box.SIMPLE, header_style="bold magenta", pad_edge=False)
+    t2.add_column("Protocol mix (system-wide)")
+    t2.add_column("Rate", justify="right")
+    t2.add_column("Note", style="dim")
+    t2.add_row("TCP segments", f"{seg_count / window:,.0f}/s", "tracked per process")
+    t2.add_row("UDP datagrams", f"{dgram_count / window:,.0f}/s",
+               "invisible to per-process tracking")
+    t2.add_row("TCP+IP headers (est.)", format_bytes(hdr_estimate),
+               f"{seg_count:,} segs x {TCP_HEADER_BYTES} B, payload-only counters miss these")
+    console.print(_RichPanel(t2, title=_RichText("Protocol mix", style="bold cyan"),
+                             border_style="cyan", padding=(1, 2)))
+
+    # ── ranked causes, from what was actually observed ──
+    findings = []
+    if tunnels and not _is_tunnel(iface):
+        findings.append(("red", f"Monitoring the physical interface {iface} while tunnel(s) "
+                                f"{', '.join(tunnels)} carry traffic. `ss` reports tunnel "
+                                f"payload but {iface} counts it encrypted and encapsulated, so "
+                                f"the whole difference is unattributable. Set "
+                                f'\'{{"interface": "{tunnels[0]}"}}\' in config.json, or accept '
+                                f"that the overhead lands in {UNATTRIBUTED}."))
+    elif _is_tunnel(iface):
+        findings.append(("green", f"{iface} is a tunnel, so socket payload and interface bytes "
+                                  f"line up. Tunnel overhead on the physical link is not counted "
+                                  f"here, so this undercounts what the carrier bills."))
+    if route_iface and route_iface != iface:
+        findings.append(("yellow", f"The default route is on {route_iface}, not the monitored "
+                                   f"{iface}. Traffic leaving via {route_iface} is missed entirely."))
+    if dgram_count > seg_count:
+        findings.append(("red", f"UDP ({dgram_count / window:,.0f} datagrams/s) outpaces TCP "
+                                f"({seg_count / window:,.0f} segments/s). QUIC/HTTP3 video, DNS "
+                                f"and video calls are all UDP, and `ss -tpin` is TCP-only."))
+    elif dgram_count:
+        findings.append(("yellow", f"UDP is running at {dgram_count / window:,.0f} datagrams/s "
+                                   f"and is never attributed to a program."))
+    # Segment counts are system-wide while iface_total is one interface, so
+    # compare headers against TCP wire bytes and only when the ratio is sane.
+    tcp_wire_est = tracked_total + hdr_estimate
+    if tracked_total > 0 and tcp_wire_est > 0:
+        hdr_share = hdr_estimate / tcp_wire_est
+        if 0.03 < hdr_share < 0.6:
+            findings.append(("yellow", f"TCP/IP headers are roughly {hdr_share * 100:.0f}% of TCP "
+                                       f"wire bytes. Socket counters report payload only, so that "
+                                       f"share can never be attributed to a program."))
+    unowned, total_socks = _socket_ownership()
+    if unowned:
+        findings.append(("yellow", f"{unowned} of {total_socks} TCP sockets have no visible owner "
+                                   f"{'(running unprivileged)' if os.geteuid() else ''}. Traffic "
+                                   f"from other users' and root's processes cannot be attributed."))
+    if not findings:
+        findings.append(("green", "Nothing structural found. The residue is most likely "
+                                  "short-lived sockets opening and closing between samples, "
+                                  "plus retransmissions and ARP/ICMP."))
+
+    if iface_total < 100_000:
+        console.print(
+            f"  [yellow]Only {format_bytes(iface_total)} crossed {iface} during the sample — too "
+            f"little to conclude much.[/yellow]\n  [dim]Re-run with a longer window while "
+            f"something is downloading, e.g.[/dim] datawall explain 30",
+            highlight=False)
+        console.print()
+
+    severity = {"red": 0, "yellow": 1, "green": 2}
+    findings.sort(key=lambda f: severity[f[0]])
+
+    console.print(_RichText("  Likely causes, ranked", style="bold cyan"))
+    # a table gives the hanging indent that a plain wrapped print does not
+    t3 = _RichTable(box=None, show_header=False, pad_edge=False, padding=(0, 1))
+    t3.add_column(width=1, no_wrap=True)
+    t3.add_column(overflow="fold")
+    for color, text in findings:
+        mark = {"red": "!", "yellow": "~", "green": "+"}[color]
+        t3.add_row(f"[{color}]{mark}[/{color}]", text)
+    console.print(_RichPadding(t3, (1, 2)))
+
+
 # ── CLI ─────────────────────────────────────────────────────
 
 def main() -> None:
@@ -863,14 +1344,18 @@ commands:
   datawall limit SIZE   set daily limit (e.g. 5GB, 500MB)
   datawall limit off    remove daily limit
   datawall connections  show active TCP connections per program
+  datawall explain      diagnose where "unattributed" traffic comes from
+  datawall explain N    same, sampling for N seconds (default 4)
         """
     )
     p.add_argument(
         'command', nargs='?', default='report',
-        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset', 'watch', 'days', 'limit', 'connections']
+        choices=['report', 'start', 'run', 'daemon', 'stop', 'restart', 'status', 'reset',
+                 'watch', 'days', 'limit', 'connections', 'explain']
     )
     p.add_argument('arg1', nargs='?', type=str, default=None,
                    help=argparse.SUPPRESS)
+    p.add_argument('--version', action='version', version=f'datawall {VERSION}')
 
     args = p.parse_args()
 
@@ -904,6 +1389,13 @@ commands:
         limit_mode(args.arg1)
     elif args.command == 'connections':
         show_connections()
+    elif args.command == 'explain':
+        try:
+            w = float(args.arg1) if args.arg1 else 4.0
+        except ValueError:
+            print("datawall: usage: datawall explain [SECONDS]")
+            sys.exit(1)
+        show_explain(max(1.0, min(300.0, w)))
     else:
         show_report()
 

@@ -1,17 +1,35 @@
 #!/bin/sh
 set -e
 
-# Stop any running datawall daemon processes
+# Stop the systemd user service wherever it is enabled.
 if command -v systemctl >/dev/null 2>&1; then
-    # Try stopping the user service for all users
-    for d in /home/* /root; do
-        uid=$(id -u "$(basename "$d")" 2>/dev/null || true)
-        [ -z "$uid" ] && continue
-        systemctl --machine="$uid@.host" --user stop datawall.service 2>/dev/null || true
+    for home in /home/* /root; do
+        [ -d "$home" ] || continue
+        user=$(basename "$home")
+        id "$user" >/dev/null 2>&1 || continue
+        systemctl --user --machine="$user@.host" stop datawall.service >/dev/null 2>&1 || true
     done
 fi
 
-# Fallback: kill any datawall daemon by exact command match
-pkill -f "^python3 .*datawall " 2>/dev/null || true
+# Stop daemons started with `datawall start`, via their pid file. Precise:
+# the pid is only signalled after confirming it really is a datawall process.
+for home in /home/* /root; do
+    pidfile="$home/.datawall/daemon.pid"
+    [ -f "$pidfile" ] || continue
+    pid=$(cat "$pidfile" 2>/dev/null) || continue
+    case "$pid" in
+        ''|*[!0-9]*) continue ;;
+    esac
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'datawall'; then
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+done
+
+# Last resort. The old pattern was anchored at '^python3 ', which never
+# matched the packaged daemon: a shebang makes the cmdline
+# '/usr/bin/python3 /usr/bin/datawall run'. Requiring the slash before the
+# script name instead matches every real invocation without hitting things
+# like 'grep datawall run'.
+pkill -f '/datawall (run|start|daemon)$' 2>/dev/null || true
 
 exit 0

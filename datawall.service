@@ -1,6 +1,6 @@
 [Unit]
 Description=datawall - Network data usage tracker
-Documentation=https://github.com/anomalyco/opencode
+Documentation=https://github.com/Erysnell/datawall
 After=network-online.target
 Wants=network-online.target
 

@@ -2,6 +2,8 @@
 
 > **Español:** También disponible en [español](README.es.md).
 
+Release notes live in [CHANGELOG.md](CHANGELOG.md).
+
 Per-process network traffic monitor for Linux. Displays each program's
 daily sent/received data in a formatted terminal table with visual bars
 and current transfer speed.
@@ -9,16 +11,17 @@ and current transfer speed.
 ```
 ╭─────────────────────────── DataWall — 2026-07-13 ────────────────────────────╮
 │                                                                              │
-│  ┏━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓           │
-│  ┃ Program  ┃    Sent ┃ Received ┃    Total ┃ %                 ┃           │
-│  ┣━━━━━━━━━━╋━━━━━━━━━╋━━━━━━━━━━╋━━━━━━━━━━╋━━━━━━━━━━━━━━━━━━━┫           │
-│  ┃ firefox  ┃ 15.2 MB ┃  82.1 MB ┃  97.3 MB ┃ ████████░░  62.2% ┃           │
-│  ┃ discord  ┃  2.1 MB ┃  12.8 MB ┃  14.9 MB ┃ ██░░░░░░░░   9.6% ┃           │
-│  ┃ other    ┃  8.7 MB ┃  35.3 MB ┃  44.0 MB ┃ ███░░░░░░░  28.2% ┃           │
-│  ┃ TOTAL    ┃ 26.0 MB ┃ 140.2 MB ┃ 166.2 MB ┃                   ┃           │
-│  ┗━━━━━━━━━━┻━━━━━━━━━┻━━━━━━━━━━┻━━━━━━━━━━┻━━━━━━━━━━━━━━━━━━━┛           │
+│  ┏━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓        │
+│  ┃ Program      ┃    Sent ┃ Received ┃    Total ┃ %                 ┃        │
+│  ┣━━━━━━━━━━━━━━╋━━━━━━━━━╋━━━━━━━━━━╋━━━━━━━━━━╋━━━━━━━━━━━━━━━━━━━┫        │
+│  ┃ firefox      ┃ 15.2 MB ┃  82.1 MB ┃  97.3 MB ┃ ██████░░░░  62.3% ┃        │
+│  ┃ unattributed ┃  8.7 MB ┃  35.3 MB ┃  44.0 MB ┃ ██░░░░░░░░  28.2% ┃        │
+│  ┃ discord      ┃  2.1 MB ┃  12.8 MB ┃  14.9 MB ┃ █░░░░░░░░░   9.5% ┃        │
+│  ┃ TOTAL        ┃ 26.0 MB ┃ 130.2 MB ┃ 156.2 MB ┃                   ┃        │
+│  ┗━━━━━━━━━━━━━━┻━━━━━━━━━┻━━━━━━━━━━┻━━━━━━━━━━┻━━━━━━━━━━━━━━━━━━━┛        │
 │                                                                              │
-╰──────────────────── Speed:  ↑ 1.2 MB/s  ↓ 3.8 MB/s   [wlo1] ────────────────╯
+╰────────────────── Speed:  ↑ 1.2 MB/s  ↓ 3.8 MB/s   [wlo1] ───────────────────╯
+  'unattributed' is 28% — run datawall explain for the breakdown
   Daemon: running
 ```
 
@@ -36,13 +39,13 @@ and current transfer speed.
 ### From .deb
 
 ```bash
-sudo apt install ./datawall_1.0.0_all.deb
+sudo apt install ./datawall_1.1.0_all.deb
 ```
 
 Or with dpkg (dependencies must be resolved manually):
 
 ```bash
-sudo dpkg -i datawall_1.0.0_all.deb
+sudo dpkg -i datawall_1.1.0_all.deb
 sudo apt install -f
 ```
 
@@ -70,6 +73,9 @@ ln -sf "$PWD/datawall" ~/.local/bin/datawall
 | `datawall limit SIZE` | Set daily limit (e.g. 5GB, 500MB) |
 | `datawall limit off` | Remove daily limit |
 | `datawall connections` | Show active TCP connections per remote address |
+| `datawall explain` | Diagnose where `unattributed` traffic comes from |
+| `datawall explain N` | Same, sampling for N seconds (default 4) |
+| `datawall --version` | Print the version |
 
 ## Auto-start with systemd
 
@@ -124,12 +130,39 @@ day column.
   socket cache deltas and timing correction
 - **Daily accumulated totals** — read live from `store.json` (reloaded
   each cycle, so daemon updates appear automatically)
-- **Residual "other" traffic** — interface traffic not captured by `ss`
+- **Residual `unattributed` traffic** — interface traffic not captured by `ss`
 - **Interface speed** — total up/down from `psutil.net_io_counters()`
+
+The table is capped to what fits the terminal — the alternate screen
+cannot scroll — and the remaining processes are folded into a single
+`… +N more` row that keeps their combined speed and totals. Rows are
+ordered by bytes used today, with current speed as the tiebreak.
 
 Press `Ctrl+C` to exit.
 
-### 6. Daily limit
+### 6. Interface selection
+
+datawall monitors one interface, chosen in this order:
+
+1. `"interface"` in `~/.datawall/config.json`, if set
+2. The interface holding the IPv4 default route (`/proc/net/route`)
+3. The first non-virtual interface with traffic
+4. The first non-virtual interface that is up
+
+Loopback, `docker*`, `br-*`, `virbr*`, `veth*`, `vmnet*` and `vboxnet*`
+are never auto-selected. The daemon re-checks the choice every 60
+seconds, so a VPN going up or down is picked up without a restart.
+
+Pin the interface manually by adding it to the config:
+
+```json
+{ "interface": "wlo1" }
+```
+
+Monitoring a physical NIC instead of the VPN tunnel measures what the
+carrier actually bills, but inflates `unattributed` by the tunnel overhead.
+
+### 7. Daily limit
 
 `datawall limit 5GB` sets a daily traffic limit stored in
 `~/.datawall/config.json`. The report and watch mode automatically
@@ -142,7 +175,29 @@ the limit:
 The daemon does not enforce the limit — it is a purely visual alert
 in the UI. Use `datawall limit off` to remove it.
 
-### 7. Connections viewer
+### 8. Unattributed-traffic diagnostic
+
+`datawall explain` answers "why is `unattributed` so large?" with
+measurements rather than guesses. It samples for a few seconds and reports:
+
+- **Where the bytes went** — interface bytes vs. bytes it could attribute
+  to TCP sockets, and the residue.
+- **Protocol mix** — TCP segment and UDP datagram rates, plus an estimate
+  of TCP/IP header bytes that payload-only counters can never see.
+- **Likely causes, ranked** — derived from what was actually observed: a
+  tunnel below the monitored interface, a default route elsewhere, UDP
+  outpacing TCP, header overhead, sockets with no visible owner.
+
+Sample for longer while something is downloading to get a useful reading:
+
+```bash
+datawall explain 30
+```
+
+A few seconds on an idle link measures almost nothing, and the command
+says so rather than reporting a meaningless 100%.
+
+### 9. Connections viewer
 
 `datawall connections` takes a snapshot of all active TCP sockets via
 `ss -tpin` and groups them by `(program, remote_address:port)`, showing
@@ -155,11 +210,46 @@ to the program's total.
 |---|---|---|
 | Daily total | `net_io_counters()` | **100%** |
 | Per program (TCP) | `ss -tpin` socket delta | **~99%** |
-| "other" | Unattributed traffic (UDP, short-lived connections between samples, retransmissions) | Varies |
+| `unattributed` | Traffic no TCP socket explained — see below | Varies |
+
+### What `unattributed` is
+
+`unattributed` (called `other` before 1.1.0) is not a program. It is the
+gap between what the interface counted and what the visible TCP sockets
+could explain, in order of typical impact:
+
+1. **A VPN below the monitored interface.** If the default route is a
+   tunnel but a physical NIC is monitored, `ss` reports tunnel payload
+   while the NIC counts the same traffic encapsulated and encrypted.
+   The whole difference is unattributable. datawall monitors the
+   default-route interface to avoid exactly this.
+2. **UDP is not measured.** `ss -tpin` is TCP only, so QUIC/HTTP3
+   (how browsers stream video today), DNS, DHCP, WireGuard and video
+   calls all land here.
+3. **Header overhead.** `net_io_counters()` counts full frames;
+   `bytes_acked` counts payload only. ~5-10% structurally.
+4. **Processes owned by other users or root.** Without privileges `ss`
+   cannot map their sockets to a PID, so `apt`, `systemd-resolved` and
+   `NetworkManager` traffic is unattributed.
+5. **Short-lived sockets** that open and close between two samples.
+6. Retransmissions, ICMP, ARP, multicast.
+
+## Retention
+
+The daemon keeps the last 90 days and drops older ones, so the store
+cannot grow without bound. Change the window in
+`~/.datawall/config.json`:
+
+```json
+{ "retention_days": 365 }
+```
+
+Pruning runs when the daemon starts and again at each date change.
 
 ## Store format
 
-Data is stored in `~/.datawall/store.json`:
+`~/.datawall/store.json` holds only durable history, and is written only
+when the accumulated bytes actually change:
 
 ```json
 {
@@ -168,27 +258,37 @@ Data is stored in `~/.datawall/store.json`:
       "total_sent": 26000000,
       "total_recv": 140200000,
       "processes": {
-        "firefox": { "sent": 15200000, "recv": 82100000 },
-        "discord": { "sent": 2100000,  "recv": 12800000 },
-        "other":   { "sent": 8700000,  "recv": 35300000 }
+        "firefox":      { "sent": 15200000, "recv": 82100000 },
+        "discord":      { "sent": 2100000,  "recv": 12800000 },
+        "unattributed": { "sent": 8700000,  "recv": 35300000 }
       }
     }
   }
 }
 ```
 
+The `unattributed` bucket was called `other` before 1.1.0. Existing
+stores are migrated automatically on first read, and the counter
+baselines and speed samples that used to be persisted here now live in
+`~/.datawall/live.json`, which the report reads to show the current
+speed without re-measuring it.
+
 ## Troubleshooting
 
 **Daemon can't find a network interface:** Make sure you have an active
-network interface (WiFi or ethernet). Loopback (`lo`) is ignored.
+network interface (WiFi or ethernet). Loopback and virtual interfaces
+(`docker*`, `br-*`, `virbr*`, `veth*`, `vmnet*`, `vboxnet*`) are never
+auto-selected; pin one explicitly with `{"interface": "..."}` in
+`~/.datawall/config.json` if detection picks the wrong one.
 
 **Report shows 0 bytes:** The daemon needs at least 5 seconds to
 accumulate data after starting. `datawall days N` will show 0 for
 future dates with no data.
 
-**"other" has a high %:** Normal during the first few samples. Over time
-the percentage stabilizes at a low value. A sustained high % indicates
-UDP traffic or very short-lived connections (API calls, DNS).
+**`unattributed` has a high %:** Run `datawall explain 30` while
+something is downloading — it measures the actual cause instead of
+guessing. The most common one by far is a VPN tunnel sitting below the
+monitored interface; see "Interface selection".
 
 **Reset data:** `datawall reset` clears today's data.
 
@@ -203,6 +303,8 @@ datawall/
 ├── Makefile                  # Build helper
 ├── README.md                 # This file
 ├── README.es.md              # Spanish documentation
+├── CHANGELOG.md              # Release notes
+├── CHANGELOG.es.md           # Spanish release notes
 ├── .gitignore
 ├── pkg/
 │   └── debian/
@@ -217,7 +319,7 @@ datawall/
 make deb
 ```
 
-Generates `datawall_1.0.0_all.deb`.
+Generates `datawall_1.1.0_all.deb`.
 
 ### Clean
 

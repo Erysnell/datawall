@@ -66,7 +66,7 @@ ln -sf "$PWD/datawall" ~/.local/bin/datawall
 | `datawall start` | Start background daemon |
 | `datawall stop` | Stop background daemon |
 | `datawall restart` | Restart daemon |
-| `datawall status` | Check if daemon is running |
+| `datawall status` | Daemon health: pid, last sample, today's usage |
 | `datawall reset` | Reset today's accumulated data |
 | `datawall watch` | Real-time bandwidth monitor (top/htop-like) |
 | `datawall days N` | Aggregated report for last N days |
@@ -141,7 +141,45 @@ ordered by bytes used today, with current speed as the tiebreak.
 
 Press `Ctrl+C` to exit.
 
-### 6. Interface selection
+### 6. Daemon health
+
+`datawall status` distinguishes three situations rather than just
+running/stopped, because a daemon whose process is alive but has stopped
+sampling used to look identical to a healthy one:
+
+```
+$ datawall status
+datawall: daemon is running (pid 12345), sampling normally
+  last sample:  3s ago
+  interface:    tun0
+  speed:        ↑ 1.2 MB/s  ↓ 3.8 MB/s
+  today:        734.3 MB of 200.0 MB limit (367%)
+  service:      systemd user unit inactive
+```
+
+```
+$ datawall status
+datawall: daemon is running (pid 12345) but has not sampled in 2h 14m
+  ...
+  The process is alive but not recording traffic. Restart it with: datawall restart
+```
+
+The verdict comes from the timestamp in `live.json`: a sample older than
+three sampling intervals means the process is alive but not working. The
+speed line is omitted in that case rather than reporting a stale figure.
+
+Exit codes make it usable from a script or a shell prompt:
+
+| Code | Meaning |
+|---|---|
+| 0 | running and sampling |
+| 1 | stopped |
+| 2 | running but not sampling |
+
+The `service` line reports whether the systemd user unit is active, which
+is usually the answer to "why was it not restarted".
+
+### 7. Interface selection
 
 datawall monitors one interface, chosen in this order:
 
@@ -163,7 +201,7 @@ Pin the interface manually by adding it to the config:
 Monitoring a physical NIC instead of the VPN tunnel measures what the
 carrier actually bills, but inflates `unattributed` by the tunnel overhead.
 
-### 7. Daily limit
+### 8. Daily limit
 
 `datawall limit 5GB` sets a daily traffic limit stored in
 `~/.datawall/config.json`. The report and watch mode automatically
@@ -210,7 +248,7 @@ quiet. Limit edits are picked up within 60 seconds, no restart needed.
 
 Use `datawall limit off` to remove the limit.
 
-### 8. Unattributed-traffic diagnostic
+### 9. Unattributed-traffic diagnostic
 
 `datawall explain` answers "why is `unattributed` so large?" with
 measurements rather than guesses. It samples for a few seconds and reports:
@@ -232,7 +270,7 @@ datawall explain 30
 A few seconds on an idle link measures almost nothing, and the command
 says so rather than reporting a meaningless 100%.
 
-### 9. Connections viewer
+### 10. Connections viewer
 
 `datawall connections` takes a snapshot of all active TCP sockets via
 `ss -tpin` and groups them by `(program, remote_address:port)`, showing

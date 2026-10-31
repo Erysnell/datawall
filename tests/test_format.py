@@ -25,6 +25,33 @@ class TestFormatBytes(IsolatedHomeTest):
         self.assertEqual(self.dw.format_speed(1024), '1.0 KB/s')
 
 
+class TestFormatDuration(IsolatedHomeTest):
+    def test_seconds_below_a_minute(self):
+        f = self.dw.format_duration
+        self.assertEqual(f(0), '0s')
+        self.assertEqual(f(5), '5s')
+        self.assertEqual(f(59), '59s')
+
+    def test_minutes_and_seconds(self):
+        self.assertEqual(self.dw.format_duration(60), '1m 0s')
+        self.assertEqual(self.dw.format_duration(130), '2m 10s')
+        self.assertEqual(self.dw.format_duration(3599), '59m 59s')
+
+    def test_hours_and_minutes(self):
+        self.assertEqual(self.dw.format_duration(3600), '1h 0m')
+        self.assertEqual(self.dw.format_duration(8040), '2h 14m')
+
+    def test_days_and_hours(self):
+        self.assertEqual(self.dw.format_duration(86400), '1d 0h')
+        self.assertEqual(self.dw.format_duration(183600), '2d 3h')
+
+    def test_fractional_seconds_truncate(self):
+        self.assertEqual(self.dw.format_duration(5.9), '5s')
+
+    def test_negative_durations_clamp_to_zero(self):
+        self.assertEqual(self.dw.format_duration(-10), '0s')
+
+
 class TestParseBytes(IsolatedHomeTest):
     def test_suffixes(self):
         p = self.dw.parse_bytes

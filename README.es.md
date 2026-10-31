@@ -66,7 +66,7 @@ ln -sf "$PWD/datawall" ~/.local/bin/datawall
 | `datawall start` | Inicia el daemon en background |
 | `datawall stop` | Detiene el daemon |
 | `datawall restart` | Reinicia el daemon |
-| `datawall status` | Muestra si el daemon está corriendo |
+| `datawall status` | Salud del daemon: pid, último muestreo, uso de hoy |
 | `datawall reset` | Resetea los datos acumulados de hoy |
 | `datawall watch` | Monitor de ancho de banda en tiempo real (top/htop) |
 | `datawall days N` | Reporte agregado de los últimos N días |
@@ -143,7 +143,46 @@ desempate.
 
 Presione `Ctrl+C` para salir.
 
-### 6. Selección de interfaz
+### 6. Salud del daemon
+
+`datawall status` distingue tres situaciones en vez de solo
+corriendo/detenido, porque un daemon cuyo proceso está vivo pero dejó de
+muestrear se veía idéntico a uno sano:
+
+```
+$ datawall status
+datawall: daemon is running (pid 12345), sampling normally
+  last sample:  3s ago
+  interface:    tun0
+  speed:        ↑ 1.2 MB/s  ↓ 3.8 MB/s
+  today:        734.3 MB of 200.0 MB limit (367%)
+  service:      systemd user unit inactive
+```
+
+```
+$ datawall status
+datawall: daemon is running (pid 12345) but has not sampled in 2h 14m
+  ...
+  The process is alive but not recording traffic. Restart it with: datawall restart
+```
+
+El veredicto sale del timestamp de `live.json`: una muestra más vieja que
+tres intervalos de muestreo significa que el proceso vive pero no trabaja.
+En ese caso se omite la línea de velocidad en vez de mostrar un valor
+viejo.
+
+Los exit codes lo hacen usable desde un script o un prompt de shell:
+
+| Código | Significado |
+|---|---|
+| 0 | corriendo y muestreando |
+| 1 | detenido |
+| 2 | corriendo pero sin muestrear |
+
+La línea `service` informa si la unidad de systemd del usuario está
+activa, que suele ser la respuesta a "por qué no se reinició solo".
+
+### 7. Selección de interfaz
 
 datawall monitorea una sola interfaz, elegida en este orden:
 
@@ -165,7 +204,7 @@ Para fijarla a mano, agregala a la config:
 Monitorear la placa física en vez del túnel VPN mide lo que realmente
 te cobra el proveedor, pero infla `unattributed` con el overhead del túnel.
 
-### 7. Límite diario
+### 8. Límite diario
 
 `datawall limit 5GB` establece un límite de tráfico diario guardado en
 `~/.datawall/config.json`. El reporte y el modo watch muestran
@@ -214,7 +253,7 @@ sin reiniciar.
 
 Use `datawall limit off` para eliminar el límite.
 
-### 8. Diagnóstico del tráfico no atribuido
+### 9. Diagnóstico del tráfico no atribuido
 
 `datawall explain` responde "¿por qué `unattributed` es tan grande?" con
 mediciones, no con suposiciones. Muestrea unos segundos y reporta:
@@ -238,7 +277,7 @@ datawall explain 30
 Unos segundos con el enlace en reposo no miden casi nada, y el comando lo
 dice en vez de reportar un 100% sin sentido.
 
-### 9. Visor de conexiones
+### 10. Visor de conexiones
 
 `datawall connections` toma una foto de todos los sockets TCP activos
 vía `ss -tpin` y los agrupa por `(programa, IP_remota:puerto)`,

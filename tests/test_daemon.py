@@ -14,7 +14,16 @@ import time
 import unittest
 from datetime import date, timedelta
 
-from helpers import SCRIPT, have_network, load_datawall, requires_slow, run_cli
+from helpers import (have_network, load_datawall, requires_slow, run_cli,
+                     spawn_dummy_process)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 TODAY = date.today().isoformat()
 VOLATILE = ('last_tx', 'last_rx', 'last_time', 'speed_sent', 'speed_recv')
@@ -182,6 +191,40 @@ class TestNotificationsDisabled(DaemonTest):
         time.sleep(6)
         self.assertNotIn('Notified', self.log())
         self.assertEqual(self.day().get('notified', []), [])
+
+
+class TestStatusAgainstARealDaemon(DaemonTest):
+    def test_a_live_daemon_reports_as_sampling(self):
+        self.start()
+        r = self.cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('sampling normally', r.stdout)
+
+    def test_status_reports_stopped_after_a_stop(self):
+        self.start()
+        self.cli('stop')
+        r = self.cli('status')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('stopped', r.stdout)
+
+    def test_a_live_process_with_an_aged_sample_reads_as_stalled(self):
+        """SIGKILL skips the cleanup handler, so the pid file survives while
+        live.json ages — exactly the silent death this must detect."""
+        self.start()
+        pid = int(self.dw.PID_PATH.read_text().strip())
+        os.kill(pid, 9)
+        self.assertTrue(self.wait(lambda: not _alive(pid), 10))
+        # The pid file outlives a SIGKILL. Stand a throwaway process in for
+        # the dead daemon rather than our own pid, which `stop` would signal.
+        proc = spawn_dummy_process()
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        self.dw.PID_PATH.write_text(str(proc.pid))
+        live = json.loads(self.dw.LIVE_PATH.read_text())
+        live['time'] -= 3600
+        self.dw.LIVE_PATH.write_text(json.dumps(live))
+        r = self.cli('status')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn('has not sampled', r.stdout)
 
 
 class TestPruneOnStartup(DaemonTest):

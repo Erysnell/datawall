@@ -68,6 +68,21 @@ def format_speed(n: float) -> str:
     return format_bytes(n) + '/s'
 
 
+def format_duration(seconds: float) -> str:
+    """Compact human duration: 4s, 2m 10s, 2h 14m, 3d 2h."""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, s = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {s}s"
+    hours, m = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {m}m"
+    days, h = divmod(hours, 24)
+    return f"{days}d {h}h"
+
+
 def parse_bytes(s: str) -> int:
     s = s.strip().lower()
     if s in ('off', 'none', '0'):
@@ -537,16 +552,21 @@ def _remove_pid():
         pass
 
 
-def daemon_status() -> bool:
+def daemon_pid() -> Optional[int]:
+    """The live daemon's pid, or None. Clears a stale pid file as a side effect."""
     if not PID_PATH.exists():
-        return False
+        return None
     try:
         pid = int(PID_PATH.read_text().strip())
         os.kill(pid, 0)
-        return True
+        return pid
     except (OSError, ValueError):
         _remove_pid()
-        return False
+        return None
+
+
+def daemon_status() -> bool:
+    return daemon_pid() is not None
 
 
 def daemon_start() -> None:
@@ -782,6 +802,95 @@ def daemon_loop() -> None:
         except (OSError, KeyError, TypeError, ValueError) as e:
             log(f"Loop error: {e}")
             time.sleep(5)
+
+
+# ── Status ──────────────────────────────────────────────────
+
+# How long the daemon may go without publishing a sample before the process
+# counts as stalled rather than merely running.
+STALL_AFTER = SAMPLE_INTERVAL * 3
+
+
+def _systemd_state() -> Optional[str]:
+    """Whether the user unit is active, so a dead daemon explains itself.
+
+    None when systemd is not in play at all.
+    """
+    try:
+        r = subprocess.run(['systemctl', '--user', 'is-active', 'datawall.service'],
+                           capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    out = r.stdout.strip()
+    if out == 'active':
+        return 'active'
+    if out in ('inactive', 'failed', 'activating', 'deactivating'):
+        return out
+    return None  # not installed, or no user manager reachable
+
+
+def show_status() -> int:
+    """Report what the daemon is actually doing.
+
+    Exit code: 0 running and sampling, 1 stopped, 2 alive but not sampling.
+    A live process that stopped sampling used to look identical to a healthy
+    one, which is how a silently dead daemon goes unnoticed for hours.
+    """
+    pid = daemon_pid()
+    live = read_live_state(float('inf'))   # read it even when stale
+    age = time.time() - live['time'] if live else None
+
+    lines = []
+    if pid is None:
+        headline = "datawall: daemon is stopped"
+        code = 1
+    elif age is None or age > STALL_AFTER:
+        seen = f"has not sampled in {format_duration(age)}" if age is not None \
+            else "has never published a sample"
+        headline = f"datawall: daemon is running (pid {pid}) but {seen}"
+        code = 2
+    else:
+        headline = f"datawall: daemon is running (pid {pid}), sampling normally"
+        code = 0
+
+    if age is not None:
+        lines.append(('last sample', f"{format_duration(age)} ago"))
+    if live and live.get('iface'):
+        lines.append(('interface', live['iface']))
+    if code == 0 and live:
+        lines.append(('speed', f"↑ {format_speed(live['speed_sent'])}"
+                               f"  ↓ {format_speed(live['speed_recv'])}"))
+
+    today = DataStore().get_today()
+    total = today.get('total_sent', 0) + today.get('total_recv', 0)
+    limit = Config().get_daily_limit()
+    if limit:
+        lines.append(('today', f"{format_bytes(total)} of {format_bytes(limit)} limit "
+                               f"({total / limit * 100:.0f}%)"))
+    else:
+        lines.append(('today', format_bytes(total)))
+
+    service = _systemd_state()
+    if service:
+        lines.append(('service', f"systemd user unit {service}"))
+
+    print(headline)
+    for label, value in lines:
+        print(f"  {label + ':':<14}{value}")
+
+    if code == 1:
+        if service == 'active':
+            print("\n  The systemd unit is active but no daemon is running; "
+                  "check `datawall` logs.")
+        else:
+            print("\n  Start it with: datawall start")
+            if service in ('inactive', 'failed'):
+                print("  Or for automatic restarts: "
+                      "systemctl --user enable --now datawall.service")
+    elif code == 2:
+        print("\n  The process is alive but not recording traffic. "
+              "Restart it with: datawall restart")
+    return code
 
 
 # ── Reporter ────────────────────────────────────────────────
@@ -1431,7 +1540,7 @@ commands:
   datawall run          run daemon in foreground (for systemd)
   datawall stop         stop background daemon
   datawall restart      restart the daemon
-  datawall status       check if daemon is running
+  datawall status       daemon health: pid, last sample, today's usage
   datawall reset        reset today's accumulated data
   datawall watch        real-time bandwidth monitor (htop-like)
   datawall days N       aggregated report for last N days
@@ -1465,7 +1574,7 @@ commands:
         time.sleep(1)
         daemon_start()
     elif args.command == 'status':
-        print("datawall: daemon is", "running" if daemon_status() else "stopped")
+        sys.exit(show_status())
     elif args.command == 'reset':
         DataStore().reset_today()
         print("datawall: today's data has been reset")

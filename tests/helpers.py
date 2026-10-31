@@ -48,6 +48,15 @@ class IsolatedHomeTest(unittest.TestCase):
         return self.dw.Config()
 
 
+def spawn_dummy_process():
+    """A harmless long-lived process to stand in for a daemon pid.
+
+    Never use the test runner's own pid for this: anything that calls
+    `datawall stop` would read the pid file and SIGTERM the test run itself.
+    """
+    return subprocess.Popen(['sleep', '600'])
+
+
 def run_cli(home: str, *args, timeout: int = 60):
     """Invoke the script as a subprocess against an isolated HOME."""
     return subprocess.run(

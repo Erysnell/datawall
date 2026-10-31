@@ -19,9 +19,17 @@ y el proyecto adhiere a [Versionado Semántico](https://semver.org/lang/es/).
   menos de 60 segundos sin reiniciar. `libnotify-bin` es un `Recommends`,
   no una dependencia dura — sin él el daemon lo registra una vez y se queda
   callado.
+- **`datawall status` ahora informa la salud del daemon en vez de una
+  línea.** Distingue un proceso que está muestreando de uno que está vivo
+  pero dejó de registrar —el modo de falla en el que un daemon muerto se ve
+  bien por horas— usando el timestamp de `live.json`. Informa el pid, la
+  antigüedad del último muestreo, la interfaz monitoreada, la velocidad
+  actual, el uso de hoy contra el límite, y si la unidad de systemd del
+  usuario está activa. Exit codes: `0` muestreando, `1` detenido, `2` vivo
+  pero sin muestrear, así que sirve desde un script o un prompt de shell.
 - `datawall limit` ahora informa si las notificaciones están realmente
   activas y en qué umbrales.
-- Una suite de tests con `unittest` en `tests/` — 147 tests que cubren los
+- Una suite de tests con `unittest` en `tests/` — 168 tests que cubren los
   parsers de tamaños y de la salida de `ss`, la migración de esquema, la
   poda por retención, el guardado condicional, todas las claves de config,
   los umbrales de notificación y la superficie de la CLI, más tests de

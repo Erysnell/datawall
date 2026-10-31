@@ -19,9 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are picked up within 60 seconds without a restart. `libnotify-bin` is a
   `Recommends`, not a hard dependency — without it the daemon logs the fact
   once and stays quiet.
+- **`datawall status` now reports daemon health instead of one line.** It
+  tells a process that is sampling apart from one that is alive but has
+  stopped recording — the failure mode where a dead daemon looks fine for
+  hours — using the timestamp in `live.json`. Reports the pid, the age of
+  the last sample, the monitored interface, current speed, today's usage
+  against the limit, and whether the systemd user unit is active. Exit
+  codes: `0` sampling, `1` stopped, `2` alive but not sampling, so it is
+  usable from a script or a shell prompt.
 - `datawall limit` now reports whether notifications are actually live and
   at which thresholds.
-- A `unittest` test suite under `tests/` — 147 tests covering the size and
+- A `unittest` test suite under `tests/` — 168 tests covering the size and
   `ss` output parsers, schema migration, retention pruning, conditional
   saves, every config key, the notification thresholds and the CLI surface,
   plus integration tests that drive a real daemon. No test dependencies;

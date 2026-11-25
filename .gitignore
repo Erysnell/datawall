@@ -2,3 +2,5 @@
 pkg/datawall/
 __pycache__/
 *.pyc
+*.tar.gz
+datawall-[0-9]*/

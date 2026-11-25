@@ -37,26 +37,96 @@ and current transfer speed.
 
 ## Installation
 
-### From .deb
+datawall is a single Python script with no compiled parts, so it runs on any
+Linux distribution. Only the packaging differs.
+
+### Debian, Ubuntu and derivatives
 
 ```bash
-sudo apt install ./datawall_1.2.0_all.deb
+sudo apt install ./datawall_1.3.0_all.deb
 ```
 
-Or with dpkg (dependencies must be resolved manually):
+Or build it from source:
 
 ```bash
-sudo dpkg -i datawall_1.2.0_all.deb
-sudo apt install -f
+sudo apt install python3-psutil python3-rich iproute2 libnotify-bin
+make deb && sudo apt install ./datawall_1.3.0_all.deb
 ```
 
-### Manual
+### Fedora, RHEL and openSUSE
+
+A spec file is included at `pkg/rpm/datawall.spec`:
 
 ```bash
-pip install psutil rich
+sudo dnf install rpm-build make python3-psutil python3-rich iproute libnotify
+make rpm
+sudo dnf install ~/rpmbuild/RPMS/noarch/datawall-1.3.0-1.*.noarch.rpm
+```
+
+`make rpm` builds the source tarball, copies it into `~/rpmbuild/SOURCES`
+and runs `rpmbuild`. The spec's `%check` stage runs the test suite, which is
+why the runtime dependencies are needed at build time.
+
+On openSUSE substitute `zypper install`; the package is still `rpm-build`.
+
+### Arch and derivatives
+
+A `PKGBUILD` is included at `pkg/arch/PKGBUILD`, written for the AUR. It
+pulls the release tarball from GitHub, so the matching tag has to be
+published first:
+
+```bash
+cd pkg/arch
+updpkgsums          # downloads the release tarball and fills in its checksum
+makepkg -si
+```
+
+To build from a local checkout instead, point `source` at the tarball
+`make dist` produces and set `sha256sums=('SKIP')`.
+
+### Any distribution, from source
+
+`make install` honours the usual `PREFIX` and `DESTDIR`, so it works
+anywhere. Install the dependencies first — the package names differ:
+
+| Distribution | Dependencies |
+|---|---|
+| Debian, Ubuntu | `python3-psutil python3-rich iproute2 libnotify-bin` |
+| Fedora, RHEL | `python3-psutil python3-rich iproute libnotify` |
+| Arch | `python-psutil python-rich iproute2 libnotify` |
+| openSUSE | `python3-psutil python3-rich iproute2 libnotify-tools` |
+| Alpine | `py3-psutil py3-rich iproute2 libnotify` |
+| Void | `python3-psutil python3-rich iproute2 libnotify` |
+
+Then:
+
+```bash
+sudo make install                        # into /usr
+sudo make install PREFIX=/usr/local      # or elsewhere
+make uninstall                           # removes it again
+```
+
+`make uninstall` leaves your data in `~/.datawall` alone.
+
+### Without root
+
+The script is self-contained, so a symlink is enough:
+
+```bash
+pip install --user psutil rich
 chmod +x datawall
 ln -sf "$PWD/datawall" ~/.local/bin/datawall
 ```
+
+There is no systemd unit in this mode; start the daemon with
+`datawall start`.
+
+### Distributions without systemd
+
+Alpine, Void and Gentoo with OpenRC have no user units. `datawall start`
+daemonises on its own and needs nothing else, so the only thing missing is
+automatic startup — add `datawall start` to your session or service manager
+of choice.
 
 ## Usage
 
@@ -380,6 +450,8 @@ datawall/
 ├── datawall                  # Main Python script (executable)
 ├── datawall.service          # systemd user unit
 ├── Makefile                  # Build helper
+├── datawall.1                # Man page
+├── LICENSE                   # MIT
 ├── README.md                 # This file
 ├── README.es.md              # Spanish documentation
 ├── CHANGELOG.md              # Release notes
@@ -387,10 +459,14 @@ datawall/
 ├── tests/                    # unittest suite (see tests/README.md)
 ├── .gitignore
 ├── pkg/
-│   └── debian/
-│       ├── control           # Debian package metadata
-│       ├── postinst          # Post-installation script
-│       └── prerm             # Pre-removal script
+│   ├── debian/
+│   │   ├── control           # Debian package metadata
+│   │   ├── postinst          # Post-installation script
+│   │   └── prerm             # Pre-removal script
+│   ├── rpm/
+│   │   └── datawall.spec     # Fedora / RHEL / openSUSE
+│   └── arch/
+│       └── PKGBUILD          # Arch / AUR
 ```
 
 ### Tests
@@ -411,7 +487,7 @@ dependencies. `test_daemon.py` starts a real daemon against a throwaway
 make deb
 ```
 
-Generates `datawall_1.2.0_all.deb`.
+Generates `datawall_1.3.0_all.deb`.
 
 ### Clean
 

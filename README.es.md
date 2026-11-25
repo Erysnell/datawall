@@ -37,26 +37,97 @@ junto con la velocidad actual.
 
 ## Instalación
 
-### Desde el .deb
+datawall es un único script de Python sin partes compiladas, así que corre en
+cualquier distribución de Linux. Lo único que cambia es el empaquetado.
+
+### Debian, Ubuntu y derivadas
 
 ```bash
-sudo apt install ./datawall_1.2.0_all.deb
+sudo apt install ./datawall_1.3.0_all.deb
 ```
 
-O con dpkg (las dependencias deben resolverse manualmente):
+O construyéndolo desde las fuentes:
 
 ```bash
-sudo dpkg -i datawall_1.2.0_all.deb
-sudo apt install -f
+sudo apt install python3-psutil python3-rich iproute2 libnotify-bin
+make deb && sudo apt install ./datawall_1.3.0_all.deb
 ```
 
-### Manual
+### Fedora, RHEL y openSUSE
+
+Hay un spec en `pkg/rpm/datawall.spec`:
 
 ```bash
-pip install psutil rich
+sudo dnf install rpm-build make python3-psutil python3-rich iproute libnotify
+make rpm
+sudo dnf install ~/rpmbuild/RPMS/noarch/datawall-1.3.0-1.*.noarch.rpm
+```
+
+`make rpm` genera el tarball de fuentes, lo copia a `~/rpmbuild/SOURCES` y
+corre `rpmbuild`. La etapa `%check` del spec corre la suite de tests, que es
+por lo que las dependencias de runtime se necesitan en tiempo de build.
+
+En openSUSE usá `zypper install`; el paquete sigue llamándose `rpm-build`.
+
+### Arch y derivadas
+
+Hay un `PKGBUILD` en `pkg/arch/PKGBUILD`, escrito para el AUR. Baja el
+tarball del release desde GitHub, así que el tag correspondiente tiene que
+estar publicado primero:
+
+```bash
+cd pkg/arch
+updpkgsums          # baja el tarball del release y completa su checksum
+makepkg -si
+```
+
+Para construirlo desde una copia local, apuntá `source` al tarball que
+genera `make dist` y poné `sha256sums=('SKIP')`.
+
+### Cualquier distribución, desde las fuentes
+
+`make install` respeta los `PREFIX` y `DESTDIR` habituales, así que funciona
+en cualquier lado. Instalá primero las dependencias — los nombres de paquete
+cambian según la distro:
+
+| Distribución | Dependencias |
+|---|---|
+| Debian, Ubuntu | `python3-psutil python3-rich iproute2 libnotify-bin` |
+| Fedora, RHEL | `python3-psutil python3-rich iproute libnotify` |
+| Arch | `python-psutil python-rich iproute2 libnotify` |
+| openSUSE | `python3-psutil python3-rich iproute2 libnotify-tools` |
+| Alpine | `py3-psutil py3-rich iproute2 libnotify` |
+| Void | `python3-psutil python3-rich iproute2 libnotify` |
+
+Después:
+
+```bash
+sudo make install                        # a /usr
+sudo make install PREFIX=/usr/local      # o a otro lado
+make uninstall                           # lo saca de nuevo
+```
+
+`make uninstall` no toca tus datos en `~/.datawall`.
+
+### Sin root
+
+El script es autocontenido, así que un symlink alcanza:
+
+```bash
+pip install --user psutil rich
 chmod +x datawall
 ln -sf "$PWD/datawall" ~/.local/bin/datawall
 ```
+
+En este modo no hay unidad de systemd; arrancá el daemon con
+`datawall start`.
+
+### Distribuciones sin systemd
+
+Alpine, Void y Gentoo con OpenRC no tienen unidades de usuario. `datawall
+start` se demoniza por su cuenta y no necesita nada más, así que lo único que
+falta es el arranque automático — agregá `datawall start` a tu sesión o al
+gestor de servicios que uses.
 
 ## Uso
 
@@ -387,6 +458,8 @@ datawall/
 ├── datawall                  # Script principal (Python, ejecutable)
 ├── datawall.service          # Unidad de systemd user
 ├── Makefile                  # Build helper
+├── datawall.1                # Man page
+├── LICENSE                   # MIT
 ├── README.md                 # Documentación en inglés
 ├── README.es.md              # Documentación en español (este archivo)
 ├── CHANGELOG.md              # Notas de release
@@ -394,10 +467,14 @@ datawall/
 ├── tests/                    # suite de unittest (ver tests/README.md)
 ├── .gitignore
 ├── pkg/
-│   └── debian/
-│       ├── control           # Metadatos del paquete Debian
-│       ├── postinst          # Post-instalación
-│       └── prerm             # Pre-eliminación
+│   ├── debian/
+│   │   ├── control           # Metadatos del paquete Debian
+│   │   ├── postinst          # Post-instalación
+│   │   └── prerm             # Pre-eliminación
+│   ├── rpm/
+│   │   └── datawall.spec     # Fedora / RHEL / openSUSE
+│   └── arch/
+│       └── PKGBUILD          # Arch / AUR
 ```
 
 ### Tests
@@ -418,7 +495,7 @@ y se saltea salvo que definas `DATAWALL_SLOW_TESTS=1`. Ver
 make deb
 ```
 
-Genera `datawall_1.2.0_all.deb`.
+Genera `datawall_1.3.0_all.deb`.
 
 ### Limpiar
 

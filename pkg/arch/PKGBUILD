@@ -1,0 +1,27 @@
+# Maintainer: Erysnell Gonzalez
+pkgname=datawall
+pkgver=1.3.0
+pkgrel=1
+pkgdesc="Track daily network usage per program"
+arch=('any')
+url="https://github.com/Erysnell/datawall"
+license=('MIT')
+# Arch names the Python packages without the 3, and ss(8) lives in iproute2.
+depends=('python' 'python-psutil' 'python-rich' 'iproute2')
+optdepends=('libnotify: desktop notifications when the daily limit is crossed')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver/$pkgname-$pkgver.tar.gz")
+# Replace with the real digest once the release tarball exists: updpkgsums
+sha256sums=('SKIP')
+
+check() {
+    cd "$pkgname-$pkgver"
+    make test
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    make install DESTDIR="$pkgdir" PREFIX=/usr
+    # Arch expects the licence text under /usr/share/licenses, not share/doc.
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    rm -rf "$pkgdir/usr/share/doc"
+}

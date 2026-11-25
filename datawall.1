@@ -1,0 +1,201 @@
+.TH DATAWALL 1 "2026-11-17" "datawall 1.3.0" "User Commands"
+.SH NAME
+datawall \- track daily network usage per program
+.SH SYNOPSIS
+.B datawall
+.RI [ command ]
+.RI [ argument ]
+.br
+.B datawall
+.B \-\-version
+.SH DESCRIPTION
+.B datawall
+runs a lightweight background daemon that samples the kernel's network
+counters every five seconds and attributes each delta to the processes that
+caused it, using exact per-socket byte counters read through
+.BR ss (8)
+(SOCK_DIAG). It reports per-program daily totals in a terminal table, with
+current transfer speeds and an optional daily traffic limit.
+.PP
+With no command, the daily report is shown.
+.SH COMMANDS
+.TP
+.B report
+Show today's usage per program. This is the default.
+.TP
+.B start
+Start the background daemon, detached from the terminal.
+.TP
+.B run
+Run the daemon in the foreground. Used by the systemd unit.
+.TP
+.B stop
+Stop the background daemon.
+.TP
+.B restart
+Stop and start the daemon.
+.TP
+.B status
+Report daemon health: pid, how long ago it last sampled, the monitored
+interface, current speed, today's usage against the limit, and whether the
+systemd user unit is active. See
+.B EXIT STATUS
+below.
+.TP
+.B reset
+Discard today's accumulated data.
+.TP
+.B watch
+Real-time per-process bandwidth monitor, in the alternate screen. The table
+is capped to the terminal height; the remaining processes are folded into a
+single summary row. Press
+.B Ctrl+C
+to exit.
+.TP
+.BI days " N"
+Aggregated report for the last
+.I N
+days, with a daily average.
+.TP
+.B limit
+Show the daily limit, how much of it has been used, and whether desktop
+notifications are active.
+.TP
+.BI limit " SIZE"
+Set the daily traffic limit.
+.I SIZE
+accepts a plain byte count or a suffix:
+.BR 5GB ,
+.BR 500MB ,
+.BR 100kb .
+.TP
+.B limit off
+Remove the daily limit.
+.TP
+.B connections
+Snapshot of active TCP connections, grouped by program and remote address.
+.TP
+.BR explain " [" \fISECONDS\fR ]
+Diagnose where
+.B unattributed
+traffic comes from. Samples for
+.I SECONDS
+(4 by default), then reports how much of the interface traffic could be
+attributed to TCP sockets, the TCP/UDP protocol mix, and the likely causes
+ranked by severity. Sample for longer while something is downloading to get
+a useful reading.
+.SH OPTIONS
+.TP
+.B \-\-version
+Print the version and exit.
+.TP
+.B \-h, \-\-help
+Print a usage summary and exit.
+.SH "UNATTRIBUTED TRAFFIC"
+The
+.B unattributed
+row is not a program. It is the difference between what the interface
+counted and what the visible TCP sockets could explain. The usual causes,
+by typical impact, are a VPN tunnel below the monitored interface; UDP
+traffic, which
+.B ss \-tpin
+cannot see and which carries QUIC/HTTP3 video; protocol header overhead,
+since socket counters report payload only; sockets owned by other users or
+by root, whose owner the kernel hides from an unprivileged process; and
+sockets that open and close between two samples.
+.B datawall explain
+measures which of these applies.
+.SH FILES
+.TP
+.I ~/.datawall/store.json
+Durable history: per-day totals and per-program breakdown. Written only when
+the accumulated bytes change.
+.TP
+.I ~/.datawall/live.json
+Volatile daemon state: current speed and monitored interface. Rewritten every
+sampling cycle and read by
+.B report
+and
+.BR status .
+.TP
+.I ~/.datawall/config.json
+Configuration. See
+.B CONFIGURATION
+below.
+.TP
+.I ~/.datawall/daemon.pid
+Pid of the running daemon.
+.TP
+.I ~/.datawall/daemon.log
+Daemon log.
+.SH CONFIGURATION
+.I ~/.datawall/config.json
+is a JSON object. All keys are optional.
+.TP
+.B daily_limit
+Daily traffic limit in bytes. Set it with
+.BR "datawall limit" .
+.TP
+.B interface
+Pin the monitored interface by name, bypassing auto-detection. By default the
+interface holding the IPv4 default route is used, and loopback and virtual
+interfaces are never selected.
+.TP
+.B retention_days
+How many days of history to keep. Default 90.
+.TP
+.B notifications
+Set to
+.B false
+to disable desktop notifications.
+.TP
+.B notify_thresholds
+Array of percentages of the daily limit that trigger a notification.
+Default
+.BR "[80, 100]" .
+.SH "EXIT STATUS"
+Most commands exit 0 on success and 1 on a usage error.
+.B datawall status
+is more specific:
+.TP
+.B 0
+The daemon is running and sampling.
+.TP
+.B 1
+The daemon is stopped.
+.TP
+.B 2
+The daemon's process is alive but it has stopped sampling.
+.SH EXAMPLES
+.TP
+Start the daemon and watch traffic live:
+.EX
+datawall start
+datawall watch
+.EE
+.TP
+Cap usage at 5 GB a day and be notified:
+.EX
+datawall limit 5GB
+.EE
+.TP
+Find out why so much traffic is unattributed:
+.EX
+datawall explain 30
+.EE
+.TP
+Last week's usage:
+.EX
+datawall days 7
+.EE
+.SH "SEE ALSO"
+.BR ss (8),
+.BR ip-route (8),
+.BR systemctl (1),
+.BR notify-send (1)
+.SH AUTHOR
+Erysnell Gonzalez
+.SH BUGS
+Report issues at
+.UR https://github.com/Erysnell/datawall
+.UE .

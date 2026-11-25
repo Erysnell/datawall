@@ -5,6 +5,30 @@ Todos los cambios relevantes de este proyecto se documentan en este archivo.
 El formato sigue [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 y el proyecto adhiere a [Versionado Semántico](https://semver.org/lang/es/).
 
+## [1.3.0] - 2026-11-17
+
+Release de empaquetado: datawall ya se puede construir como paquete nativo
+en las principales familias de distros no derivadas de Debian. Sin cambios
+en el comportamiento del programa.
+
+### Agregado
+
+- **Empaquetado para distribuciones no derivadas de Debian.** Un spec de RPM
+  en `pkg/rpm/datawall.spec` para Fedora, RHEL y openSUSE, y un `PKGBUILD`
+  de AUR en `pkg/arch/PKGBUILD` para Arch. Los dos pasan por el mismo
+  `make install`, así que no puede quedar un archivo en un formato y
+  olvidado en otro. Targets nuevos: `make dist` para el tarball de fuentes,
+  `make rpm`, y `make spec` para sincronizar ambos archivos de empaquetado
+  con la versión del script.
+- `make install` respeta `DESTDIR` y `PREFIX` (más `BINDIR`, `MANDIR`,
+  `DOCDIR`, `UNITDIR`), que es lo que necesitan los empaquetadores de cada
+  distro para armar un build, y hace que `PREFIX=/usr/local` funcione. Se
+  agregó `make uninstall`.
+- Un man page, `datawall.1`, instalado como `datawall(1)` y comprimido en el
+  `.deb` como exige la política de Debian.
+- Un archivo `LICENSE`. El README declaraba MIT pero no se distribuía el
+  texto de la licencia, lo que bloquea el empaquetado en toda distro.
+
 ## [1.2.0] - 2026-10-31
 
 ### Agregado
@@ -140,6 +164,7 @@ Primer release empaquetado.
   `status`) y `reset`.
 - Empaquetado Debian y unidad systemd de usuario.
 
+[1.3.0]: https://github.com/Erysnell/datawall/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Erysnell/datawall/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Erysnell/datawall/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Erysnell/datawall/releases/tag/v1.0.0

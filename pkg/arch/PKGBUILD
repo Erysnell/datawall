@@ -11,7 +11,7 @@ depends=('python' 'python-psutil' 'python-rich' 'iproute2')
 optdepends=('libnotify: desktop notifications when the daily limit is crossed')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver/$pkgname-$pkgver.tar.gz")
 # Replace with the real digest once the release tarball exists: updpkgsums
-sha256sums=('SKIP')
+sha256sums=('9f9dda5c439b5a3c0aaf6ffaf64e1a13e3c65d904f94f644b8e021e48b769464')
 
 check() {
     cd "$pkgname-$pkgver"
